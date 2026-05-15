@@ -31,6 +31,12 @@ published_at_path = "published_at"
 
 The provider response must be JSON. Dot paths such as `data.results` are supported for nested objects.
 
+## Extending Providers
+
+Use the configurable `JsonHttpProvider` path when an upstream source already returns stable JSON with ready-to-map magnet fields. Write a custom Python provider when you need multi-step fetching, authentication, non-JSON parsing, magnet generation, or provider-specific normalization.
+
+The full contributor guide is in [docs/custom-provider-development.md](/Users/fujiao.li/source/magnet_search/docs/custom-provider-development.md).
+
 ## Output Columns
 
 Batch output writes:
