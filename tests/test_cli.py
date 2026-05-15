@@ -114,6 +114,51 @@ def test_search_command_all_providers_failed_exits_1(monkeypatch):
     assert "Traceback" not in result.stderr
 
 
+def test_search_command_writes_batch_csv_with_default_query_column(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    input_path.write_text("query\nsample movie\n", encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["search", str(input_path), "--output", str(output_path)])
+
+    assert result.exit_code == 0
+    rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
+    assert rows[0]["query"] == "sample movie"
+    assert rows[0]["title"] == "Sample Result"
+    assert "wrote" in result.stdout
+
+
+def test_search_command_writes_batch_csv_with_custom_column(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    input_path.write_text("title\nsample movie\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        ["search", str(input_path), "--column", "title", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0
+    rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
+    assert rows[0]["query"] == "sample movie"
+    assert rows[0]["title"] == "Sample Result"
+
+
+def test_search_command_batch_mode_requires_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("query\nsample movie\n", encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["search", str(input_path)])
+
+    assert result.exit_code == 1
+    assert "batch search requires --output" in result.stderr
+    assert "Traceback" not in result.output
+    assert "Traceback" not in result.stderr
+
+
 @pytest.mark.parametrize(
     "error",
     [

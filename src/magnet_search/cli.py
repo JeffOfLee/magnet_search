@@ -110,34 +110,13 @@ def _upload_download_results(
     return uploaded
 
 
-@app.command()
-def search(
-    query: str,
-    limit: int = typer.Option(3, min=1, help="Maximum number of results."),
-    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a table."),
-) -> None:
-    service = _build_search_service_or_exit()
-    try:
-        results, warnings = service.search(query, limit)
-    except AllProvidersFailed as error:
-        _print_error(error)
-        raise typer.Exit(1) from error
-
-    _print_warnings(warnings)
-    if json_output:
-        typer.echo(json.dumps([asdict(result) for result in results], ensure_ascii=False, indent=2))
-    else:
-        _render_table(results)
-
-
-@app.command()
-def batch(
+def _run_search_batch_or_exit(
     input_csv: Path,
-    column: str = typer.Option(..., help="CSV column containing resource names."),
-    output: Path = typer.Option(..., "--output", "-o", help="Output CSV path."),
-    limit: int = typer.Option(3, min=1, help="Maximum results per resource."),
+    column: str,
+    output: Path,
+    limit: int,
+    service: SearchService,
 ) -> None:
-    service = _build_search_service_or_exit()
     warning_printer = BatchWarningPrinter()
 
     def search_func(query: str, per_query_limit: int) -> list[SearchResult]:
@@ -159,6 +138,46 @@ def batch(
 
     warning_printer.print_repeat_summary()
     typer.echo(f"wrote {output}")
+
+
+@app.command()
+def search(
+    query: str,
+    limit: int = typer.Option(3, min=1, help="Maximum number of results."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a table."),
+    column: str = typer.Option("query", help="CSV column containing resource names."),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Batch output CSV path."),
+) -> None:
+    service = _build_search_service_or_exit()
+    if _is_csv_batch_source(query):
+        if output is None:
+            _print_error(ValueError("batch search requires --output"))
+            raise typer.Exit(1)
+        _run_search_batch_or_exit(Path(query), column=column, output=output, limit=limit, service=service)
+        return
+
+    try:
+        results, warnings = service.search(query, limit)
+    except AllProvidersFailed as error:
+        _print_error(error)
+        raise typer.Exit(1) from error
+
+    _print_warnings(warnings)
+    if json_output:
+        typer.echo(json.dumps([asdict(result) for result in results], ensure_ascii=False, indent=2))
+    else:
+        _render_table(results)
+
+
+@app.command()
+def batch(
+    input_csv: Path,
+    column: str = typer.Option(..., help="CSV column containing resource names."),
+    output: Path = typer.Option(..., "--output", "-o", help="Output CSV path."),
+    limit: int = typer.Option(3, min=1, help="Maximum results per resource."),
+) -> None:
+    service = _build_search_service_or_exit()
+    _run_search_batch_or_exit(input_csv, column=column, output=output, limit=limit, service=service)
 
 
 @app.command()

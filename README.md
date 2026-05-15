@@ -7,13 +7,32 @@
 ```bash
 magnet-search search "resource name" --limit 3
 magnet-search search "resource name" --limit 3 --json
-magnet-search batch input.csv --column title --output results.csv --limit 3
+magnet-search search input.csv --output results.csv --limit 3
+magnet-search search input.csv --column title --output results.csv --limit 3
 magnet-search download "magnet:?xt=..." --output downloads/
 magnet-search download input.csv --output downloads/
 magnet-search download input.csv --column magnet --output downloads/ --upload s3-upload.toml
 ```
 
 The built-in provider targets public/legal metadata. The tool does not include built-in piracy or gray-market sources. Additional providers can be configured by the user in TOML.
+
+## Searching
+
+The `search` command accepts either a single query or a CSV path:
+
+```bash
+magnet-search search "resource name" --limit 3
+magnet-search search input.csv --output results.csv
+magnet-search search input.csv --column title --output results.csv
+```
+
+If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `query`; use `--column` to override it. Batch search requires `--output`.
+
+The legacy `batch` command is still available for existing scripts:
+
+```bash
+magnet-search batch input.csv --column title --output results.csv --limit 3
+```
 
 ## Custom HTTP Providers
 
