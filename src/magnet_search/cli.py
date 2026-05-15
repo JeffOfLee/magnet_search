@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tomllib
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
@@ -99,14 +100,27 @@ def _is_csv_batch_source(source: str) -> bool:
     return path.exists() and path.suffix.lower() == ".csv"
 
 
-def _upload_download_results(
+def _upload_download_result(
     uploader: S3Uploader,
-    results: list[DownloadResult],
+    result: DownloadResult,
     output_dir: Path,
 ) -> list[str]:
+    if not result.files:
+        return []
+    return uploader.upload_files(result.files, output_dir)
+
+
+def _collect_upload_futures(upload_futures: list[Future[list[str]]]) -> list[str]:
     uploaded: list[str] = []
-    for result in results:
-        uploaded.extend(uploader.upload_files(result.files, output_dir))
+    failures: list[Exception] = []
+    for future in as_completed(upload_futures):
+        try:
+            uploaded.extend(future.result())
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        details = "; ".join(str(error) for error in failures)
+        raise UploadError(f"{len(failures)} upload(s) failed: {details}")
     return uploaded
 
 
@@ -186,22 +200,58 @@ def download(
     output: Path = typer.Option(Path("downloads"), "--output", "-o", help="Directory for downloaded files."),
     column: str = typer.Option("magnet", help="CSV column containing magnet links."),
     upload: Path | None = typer.Option(None, "--upload", help="S3 upload TOML config path."),
+    download_concurrency: int = typer.Option(1, min=1, help="Concurrent downloads for CSV batch input."),
+    upload_concurrency: int = typer.Option(1, min=1, help="Concurrent S3 uploads when --upload is provided."),
 ) -> None:
     try:
         uploader = build_s3_uploader(upload) if upload is not None else None
         downloader = build_downloader()
 
-        if _is_csv_batch_source(source):
-            results = run_download_batch(Path(source), column=column, output_dir=output, downloader=downloader)
-            file_count = sum(len(result.files) for result in results)
-            typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
-        else:
-            result = downloader.download(source, output)
-            results = [result]
-            typer.echo(f"downloaded {len(result.files)} file(s)")
+        if uploader is None:
+            if _is_csv_batch_source(source):
+                results = run_download_batch(
+                    Path(source),
+                    column=column,
+                    output_dir=output,
+                    downloader=downloader,
+                    download_concurrency=download_concurrency,
+                )
+                file_count = sum(len(result.files) for result in results)
+                typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
+            else:
+                result = downloader.download(source, output)
+                typer.echo(f"downloaded {len(result.files)} file(s)")
+            return
 
-        if uploader is not None:
-            uploaded = _upload_download_results(uploader, results, output)
+        upload_futures: list[Future[list[str]]] = []
+        download_error: DownloadError | None = None
+        with ThreadPoolExecutor(max_workers=upload_concurrency) as upload_executor:
+
+            def enqueue_upload(result: DownloadResult) -> None:
+                upload_futures.append(upload_executor.submit(_upload_download_result, uploader, result, output))
+
+            if _is_csv_batch_source(source):
+                try:
+                    results = run_download_batch(
+                        Path(source),
+                        column=column,
+                        output_dir=output,
+                        downloader=downloader,
+                        download_concurrency=download_concurrency,
+                        on_result=enqueue_upload,
+                    )
+                    file_count = sum(len(result.files) for result in results)
+                    typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
+                except DownloadError as error:
+                    download_error = error
+            else:
+                result = downloader.download(source, output)
+                enqueue_upload(result)
+                typer.echo(f"downloaded {len(result.files)} file(s)")
+
+            uploaded = _collect_upload_futures(upload_futures)
+            if download_error is not None:
+                raise download_error
             typer.echo(f"uploaded {len(uploaded)} file(s)")
     except (DownloadError, UploadConfigError, UploadError, tomllib.TOMLDecodeError, OSError) as error:
         _print_error(error)

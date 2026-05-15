@@ -1,4 +1,6 @@
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,27 @@ class FakeRunner:
             (self.output_dir / f"download-{len(self.calls)}.bin").write_text("payload", encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
         return subprocess.CompletedProcess(command, self.returncode, stdout="partial", stderr="failed")
+
+
+class TrackingDownloader:
+    def __init__(self, delay: float = 0.01):
+        self.delay = delay
+        self.active = 0
+        self.max_active = 0
+        self.calls = []
+        self.lock = threading.Lock()
+
+    def download(self, source: str, output_dir: Path):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append(source)
+        try:
+            time.sleep(self.delay)
+            return type("Result", (), {"magnet": source, "files": [output_dir / f"{source}.bin"]})()
+        finally:
+            with self.lock:
+                self.active -= 1
 
 
 def test_aria2c_downloader_builds_command_and_returns_downloaded_files(tmp_path: Path):
@@ -120,6 +143,52 @@ def test_run_download_batch_resolves_relative_torrent_paths_from_csv_directory(t
 
     assert runner.calls[0]["command"][-1] == str(torrent_path)
     assert results[0].magnet == str(torrent_path)
+
+
+def test_run_download_batch_respects_download_concurrency(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text(
+        "magnet\nfirst\nsecond\nthird\nfourth\n",
+        encoding="utf-8",
+    )
+    downloader = TrackingDownloader()
+
+    results = run_download_batch(
+        input_path,
+        column="magnet",
+        output_dir=output_dir,
+        downloader=downloader,
+        download_concurrency=2,
+    )
+
+    assert len(results) == 4
+    assert downloader.max_active == 2
+
+
+def test_run_download_batch_aggregates_download_failures(tmp_path: Path):
+    class FailingDownloader:
+        def download(self, source: str, output_dir: Path):
+            if source in {"bad-one", "bad-two"}:
+                raise DownloadError(f"{source} failed")
+            return type("Result", (), {"magnet": source, "files": []})()
+
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\ngood\nbad-one\nbad-two\n", encoding="utf-8")
+
+    with pytest.raises(DownloadError) as error:
+        run_download_batch(
+            input_path,
+            column="magnet",
+            output_dir=tmp_path / "downloads",
+            downloader=FailingDownloader(),
+            download_concurrency=2,
+        )
+
+    message = str(error.value)
+    assert "2 download(s) failed" in message
+    assert "bad-one failed" in message
+    assert "bad-two failed" in message
 
 
 def test_run_download_batch_rejects_missing_column(tmp_path: Path):

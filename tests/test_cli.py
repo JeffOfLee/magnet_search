@@ -1,5 +1,7 @@
 import csv
 import json
+import threading
+import time
 import tomllib
 
 import pytest
@@ -68,6 +70,26 @@ class FakeUploader:
     def upload_files(self, files, base_dir):
         self.calls.append((files, base_dir))
         return ["s3://my-bucket/movie.mp4"]
+
+
+class TrackingUploader:
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+        self.calls = []
+        self.lock = threading.Lock()
+
+    def upload_files(self, files, base_dir):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append((files, base_dir))
+        try:
+            time.sleep(0.01)
+            return [f"s3://my-bucket/{path.name}" for path in files]
+        finally:
+            with self.lock:
+                self.active -= 1
 
 
 def test_search_command_renders_table(monkeypatch):
@@ -274,6 +296,74 @@ def test_download_command_downloads_csv_batch_with_custom_column(monkeypatch, tm
 
     assert result.exit_code == 0
     assert [call[0] for call in downloader.calls] == ["magnet:?xt=urn:btih:first"]
+
+
+def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_path):
+    captured = {}
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "build_downloader", lambda: FakeDownloader())
+
+    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
+        captured["download_concurrency"] = download_concurrency
+        return []
+
+    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--output",
+            str(tmp_path / "downloads"),
+            "--download-concurrency",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["download_concurrency"] == 3
+
+
+def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\nsecond\nthird\nfourth\n", encoding="utf-8")
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploader = TrackingUploader()
+    monkeypatch.setattr(cli, "build_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+
+    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
+        results = []
+        for index in range(4):
+            result = cli.DownloadResult(magnet=f"source-{index}", files=[output_dir / f"movie-{index}.mp4"])
+            results.append(result)
+            if on_result is not None:
+                on_result(result)
+        return results
+
+    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--output",
+            str(tmp_path / "downloads"),
+            "--upload",
+            str(upload_path),
+            "--upload-concurrency",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(uploader.calls) == 4
+    assert uploader.max_active == 2
+    assert "uploaded 4 file(s)" in result.stdout
 
 
 def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tmp_path):

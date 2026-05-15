@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +19,7 @@ class DownloadResult:
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+ResultCallback = Callable[[DownloadResult], None]
 
 
 def _snapshot_files(directory: Path) -> dict[Path, tuple[int, int]]:
@@ -92,20 +94,64 @@ def _validate_headers(fieldnames: list[str] | None, column: str) -> None:
         seen.add(fieldname)
 
 
+def _failure_message(failures: list[tuple[str, Exception]]) -> str:
+    details = "; ".join(f"{source}: {error}" for source, error in failures)
+    return f"{len(failures)} download(s) failed: {details}"
+
+
 def run_download_batch(
     input_path: Path,
     column: str,
     output_dir: Path,
     downloader: Any,
+    download_concurrency: int = 1,
+    on_result: ResultCallback | None = None,
 ) -> list[DownloadResult]:
+    if download_concurrency < 1:
+        raise DownloadError("download_concurrency must be at least 1")
+
     with input_path.open(newline="", encoding="utf-8-sig") as input_file:
         reader = csv.DictReader(input_file)
         _validate_headers(reader.fieldnames, column)
 
+        sources = [
+            _resolve_download_source(source, input_path.parent)
+            for row in reader
+            if (source := row.get(column, "")).strip()
+        ]
+
         results: list[DownloadResult] = []
-        for row in reader:
-            source = row.get(column, "")
-            if not source.strip():
-                continue
-            results.append(downloader.download(_resolve_download_source(source, input_path.parent), output_dir))
+        failures: list[tuple[str, Exception]] = []
+
+        if download_concurrency == 1:
+            for source in sources:
+                try:
+                    result = downloader.download(source, output_dir)
+                except Exception as error:
+                    failures.append((source, error))
+                    continue
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
+        else:
+            with ThreadPoolExecutor(max_workers=download_concurrency) as executor:
+                futures = {
+                    executor.submit(downloader.download, source, output_dir): (index, source)
+                    for index, source in enumerate(sources)
+                }
+                indexed_results: list[tuple[int, DownloadResult]] = []
+                for future in as_completed(futures):
+                    index, source = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as error:
+                        failures.append((source, error))
+                        continue
+                    indexed_results.append((index, result))
+                    if on_result is not None:
+                        on_result(result)
+                results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+
+        if failures:
+            raise DownloadError(_failure_message(failures))
         return results
