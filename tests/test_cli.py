@@ -113,6 +113,18 @@ def test_search_command_renders_json(monkeypatch):
     assert payload[0]["title"] == "Sample Result"
 
 
+def test_search_command_verbose_logs_to_stderr_without_breaking_json(monkeypatch):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+
+    result = runner.invoke(cli.app, ["search", "sample movie", "--json", "--verbose"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload[0]["title"] == "Sample Result"
+    assert "verbose search mode=single query=sample movie limit=3" in result.stderr
+    assert "verbose search results=1 warnings=0" in result.stderr
+
+
 def test_search_command_prints_warnings_to_stderr_with_parseable_json(monkeypatch):
     monkeypatch.setattr(cli, "build_search_service", lambda: WarningService())
 
@@ -166,6 +178,23 @@ def test_search_command_writes_batch_csv_with_custom_column(monkeypatch, tmp_pat
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
     assert rows[0]["query"] == "sample movie"
     assert rows[0]["title"] == "Sample Result"
+
+
+def test_search_command_verbose_logs_batch_routing(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    input_path.write_text("query\nsample movie\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        ["search", str(input_path), "--output", str(output_path), "--verbose"],
+    )
+
+    assert result.exit_code == 0
+    assert "verbose search mode=batch" in result.stderr
+    assert f"input={input_path}" in result.stderr
+    assert f"output={output_path}" in result.stderr
 
 
 def test_search_command_batch_mode_requires_output(monkeypatch, tmp_path):
@@ -389,6 +418,36 @@ def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tm
     assert result.exit_code == 0
     assert uploader.calls == [([tmp_path / "downloads" / "movie.mp4"], tmp_path / "downloads")]
     assert "uploaded 1 file(s)" in result.stdout
+
+
+def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    uploader = FakeUploader()
+    upload_path = tmp_path / "s3-upload.toml"
+    output_path = tmp_path / "downloads"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            "magnet:?xt=urn:btih:sample",
+            "--output",
+            str(output_path),
+            "--upload",
+            str(upload_path),
+            "--verbose",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "verbose download mode=single source=magnet:?xt=urn:btih:sample" in result.stderr
+    assert f"output={output_path}" in result.stderr
+    assert f"upload_config={upload_path}" in result.stderr
+    assert "verbose download completed files=1" in result.stderr
+    assert "verbose upload completed files=1" in result.stderr
 
 
 def test_download_command_exits_cleanly_on_download_error(monkeypatch, tmp_path):

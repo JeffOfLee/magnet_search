@@ -23,7 +23,7 @@ from magnet_search.storage import S3Uploader, UploadConfigError, UploadError, lo
 
 app = typer.Typer(help="Search legal/public and user-configured magnet resources.")
 console = Console(width=240)
-error_console = Console(stderr=True)
+error_console = Console(stderr=True, width=1000)
 BUILD_ERRORS = (ConfigError, tomllib.TOMLDecodeError, OSError, RuntimeError)
 
 
@@ -48,6 +48,11 @@ def build_s3_uploader(upload_config_path: Path) -> S3Uploader:
 
 def _print_error(error: Exception) -> None:
     error_console.print(f"[red]error[/red] {error}")
+
+
+def _verbose(enabled: bool, message: str) -> None:
+    if enabled:
+        error_console.print(f"[dim]verbose[/dim] {message}")
 
 
 def _build_search_service_or_exit() -> SearchService:
@@ -130,12 +135,16 @@ def _run_search_batch_or_exit(
     output: Path,
     limit: int,
     service: SearchService,
+    verbose: bool = False,
 ) -> None:
     warning_printer = BatchWarningPrinter()
+    _verbose(verbose, f"batch input={input_csv} column={column} output={output} limit={limit}")
 
     def search_func(query: str, per_query_limit: int) -> list[SearchResult]:
+        _verbose(verbose, f"batch query={query} limit={per_query_limit}")
         results, warnings = service.search(query, per_query_limit)
         warning_printer.print_once(warnings)
+        _verbose(verbose, f"batch query={query} results={len(results)} warnings={len(warnings)}")
         return results
 
     try:
@@ -151,6 +160,7 @@ def _run_search_batch_or_exit(
         raise typer.Exit(1) from error
 
     warning_printer.print_repeat_summary()
+    _verbose(verbose, f"batch wrote={output}")
     typer.echo(f"wrote {output}")
 
 
@@ -161,15 +171,25 @@ def search(
     json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a table."),
     column: str = typer.Option("query", help="CSV column containing resource names."),
     output: Path | None = typer.Option(None, "--output", "-o", help="Batch output CSV path."),
+    verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
 ) -> None:
     service = _build_search_service_or_exit()
     if _is_csv_batch_source(query):
         if output is None:
             _print_error(ValueError("batch search requires --output"))
             raise typer.Exit(1)
-        _run_search_batch_or_exit(Path(query), column=column, output=output, limit=limit, service=service)
+        _verbose(verbose, f"search mode=batch input={Path(query)} column={column} output={output} limit={limit}")
+        _run_search_batch_or_exit(
+            Path(query),
+            column=column,
+            output=output,
+            limit=limit,
+            service=service,
+            verbose=verbose,
+        )
         return
 
+    _verbose(verbose, f"search mode=single query={query} limit={limit}")
     try:
         results, warnings = service.search(query, limit)
     except AllProvidersFailed as error:
@@ -177,6 +197,7 @@ def search(
         raise typer.Exit(1) from error
 
     _print_warnings(warnings)
+    _verbose(verbose, f"search results={len(results)} warnings={len(warnings)}")
     if json_output:
         typer.echo(json.dumps([asdict(result) for result in results], ensure_ascii=False, indent=2))
     else:
@@ -189,9 +210,10 @@ def batch(
     column: str = typer.Option(..., help="CSV column containing resource names."),
     output: Path = typer.Option(..., "--output", "-o", help="Output CSV path."),
     limit: int = typer.Option(3, min=1, help="Maximum results per resource."),
+    verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
 ) -> None:
     service = _build_search_service_or_exit()
-    _run_search_batch_or_exit(input_csv, column=column, output=output, limit=limit, service=service)
+    _run_search_batch_or_exit(input_csv, column=column, output=output, limit=limit, service=service, verbose=verbose)
 
 
 @app.command()
@@ -202,13 +224,24 @@ def download(
     upload: Path | None = typer.Option(None, "--upload", help="S3 upload TOML config path."),
     download_concurrency: int = typer.Option(1, min=1, help="Concurrent downloads for CSV batch input."),
     upload_concurrency: int = typer.Option(1, min=1, help="Concurrent S3 uploads when --upload is provided."),
+    verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
 ) -> None:
     try:
         uploader = build_s3_uploader(upload) if upload is not None else None
         downloader = build_downloader()
+        is_batch = _is_csv_batch_source(source)
+        mode = "batch" if is_batch else "single"
+        _verbose(
+            verbose,
+            (
+                f"download mode={mode} source={source} output={output} "
+                f"download_concurrency={download_concurrency} upload_config={upload} "
+                f"upload_concurrency={upload_concurrency}"
+            ),
+        )
 
         if uploader is None:
-            if _is_csv_batch_source(source):
+            if is_batch:
                 results = run_download_batch(
                     Path(source),
                     column=column,
@@ -217,9 +250,11 @@ def download(
                     download_concurrency=download_concurrency,
                 )
                 file_count = sum(len(result.files) for result in results)
+                _verbose(verbose, f"download completed items={len(results)} files={file_count}")
                 typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
             else:
                 result = downloader.download(source, output)
+                _verbose(verbose, f"download completed files={len(result.files)}")
                 typer.echo(f"downloaded {len(result.files)} file(s)")
             return
 
@@ -228,9 +263,10 @@ def download(
         with ThreadPoolExecutor(max_workers=upload_concurrency) as upload_executor:
 
             def enqueue_upload(result: DownloadResult) -> None:
+                _verbose(verbose, f"upload enqueue source={result.magnet} files={len(result.files)}")
                 upload_futures.append(upload_executor.submit(_upload_download_result, uploader, result, output))
 
-            if _is_csv_batch_source(source):
+            if is_batch:
                 try:
                     results = run_download_batch(
                         Path(source),
@@ -241,17 +277,20 @@ def download(
                         on_result=enqueue_upload,
                     )
                     file_count = sum(len(result.files) for result in results)
+                    _verbose(verbose, f"download completed items={len(results)} files={file_count}")
                     typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
                 except DownloadError as error:
                     download_error = error
             else:
                 result = downloader.download(source, output)
                 enqueue_upload(result)
+                _verbose(verbose, f"download completed files={len(result.files)}")
                 typer.echo(f"downloaded {len(result.files)} file(s)")
 
             uploaded = _collect_upload_futures(upload_futures)
             if download_error is not None:
                 raise download_error
+            _verbose(verbose, f"upload completed files={len(uploaded)}")
             typer.echo(f"uploaded {len(uploaded)} file(s)")
     except (DownloadError, UploadConfigError, UploadError, tomllib.TOMLDecodeError, OSError) as error:
         _print_error(error)

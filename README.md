@@ -7,6 +7,7 @@
 ```bash
 magnet-search search "resource name" --limit 3
 magnet-search search "resource name" --limit 3 --json
+magnet-search search "resource name" --limit 3 --verbose
 magnet-search search input.csv --output results.csv --limit 3
 magnet-search search input.csv --column title --output results.csv --limit 3
 magnet-search download "magnet:?xt=..." --output downloads/
@@ -26,6 +27,7 @@ The `search` command accepts either a single query or a CSV path:
 magnet-search search "resource name" --limit 3
 magnet-search search input.csv --output results.csv
 magnet-search search input.csv --column title --output results.csv
+magnet-search search input.csv --output results.csv --verbose
 ```
 
 If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `query`; use `--column` to override it. Batch search requires `--output`.
@@ -66,6 +68,7 @@ magnet-search download "magnet:?xt=..." --output downloads/
 magnet-search download movie.torrent --output downloads/
 magnet-search download input.csv --output downloads/
 magnet-search download input.csv --column link --output downloads/
+magnet-search download input.csv --output downloads/ --verbose
 ```
 
 If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
@@ -78,6 +81,8 @@ magnet-search download input.csv --output downloads/ --download-concurrency 4 --
 ```
 
 `--download-concurrency` controls how many CSV batch rows can download at the same time. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Both default to `1`.
+
+Add `--verbose` to print detailed process logs to stderr. Normal stdout remains unchanged, so JSON output and CSV file outputs stay parseable.
 
 Example `s3-upload.toml`:
 
