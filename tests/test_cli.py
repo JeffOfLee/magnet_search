@@ -7,6 +7,8 @@ from typer.testing import CliRunner
 
 from magnet_search import cli
 from magnet_search.config import ConfigError
+from magnet_search.download import DownloadError
+from magnet_search.storage import UploadConfigError
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
 
 
@@ -48,6 +50,24 @@ class WarningService:
 class FailingService:
     def search(self, query: str, limit: int):
         raise AllProvidersFailed("all providers failed")
+
+
+class FakeDownloader:
+    def __init__(self):
+        self.calls = []
+
+    def download(self, magnet, output_dir):
+        self.calls.append((magnet, output_dir))
+        return cli.DownloadResult(magnet=magnet.strip(), files=[output_dir / "movie.mp4"])
+
+
+class FakeUploader:
+    def __init__(self):
+        self.calls = []
+
+    def upload_files(self, files, base_dir):
+        self.calls.append((files, base_dir))
+        return ["s3://my-bucket/movie.mp4"]
 
 
 def test_search_command_renders_table(monkeypatch):
@@ -164,3 +184,115 @@ def test_batch_command_deduplicates_repeated_warnings(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert result.stderr.count("test-provider") == 1
     assert result.stderr.count("temporary issue") == 1
+
+
+def test_download_command_downloads_single_magnet(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+
+    result = runner.invoke(
+        cli.app,
+        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "downloads")],
+    )
+
+    assert result.exit_code == 0
+    assert downloader.calls == [("magnet:?xt=urn:btih:sample", tmp_path / "downloads")]
+    assert "downloaded 1 file(s)" in result.stdout
+
+
+def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["download", str(input_path), "--output", str(tmp_path / "downloads")])
+
+    assert result.exit_code == 0
+    assert [call[0] for call in downloader.calls] == [
+        "magnet:?xt=urn:btih:first",
+        "magnet:?xt=urn:btih:second",
+    ]
+    assert "downloaded 2 item(s), 2 file(s)" in result.stdout
+
+
+def test_download_command_downloads_csv_batch_with_custom_column(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("link\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        ["download", str(input_path), "--column", "link", "--output", str(tmp_path / "downloads")],
+    )
+
+    assert result.exit_code == 0
+    assert [call[0] for call in downloader.calls] == ["magnet:?xt=urn:btih:first"]
+
+
+def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    uploader = FakeUploader()
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            "magnet:?xt=urn:btih:sample",
+            "--output",
+            str(tmp_path / "downloads"),
+            "--upload",
+            str(upload_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert uploader.calls == [([tmp_path / "downloads" / "movie.mp4"], tmp_path / "downloads")]
+    assert "uploaded 1 file(s)" in result.stdout
+
+
+def test_download_command_exits_cleanly_on_download_error(monkeypatch, tmp_path):
+    class FailingDownloader:
+        def download(self, magnet, output_dir):
+            raise DownloadError("download failed")
+
+    monkeypatch.setattr(cli, "build_downloader", lambda: FailingDownloader())
+
+    result = runner.invoke(
+        cli.app,
+        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "downloads")],
+    )
+
+    assert result.exit_code == 1
+    assert "download failed" in result.stderr
+    assert "Traceback" not in result.output
+    assert "Traceback" not in result.stderr
+
+
+def test_download_command_exits_cleanly_on_upload_config_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_downloader", lambda: FakeDownloader())
+
+    def fail_upload(path):
+        raise UploadConfigError("bad upload config")
+
+    monkeypatch.setattr(cli, "build_s3_uploader", fail_upload)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            "magnet:?xt=urn:btih:sample",
+            "--output",
+            str(tmp_path / "downloads"),
+            "--upload",
+            str(tmp_path / "missing.toml"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "bad upload config" in result.stderr

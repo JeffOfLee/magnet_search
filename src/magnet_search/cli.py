@@ -12,10 +12,12 @@ from rich.table import Table
 
 from magnet_search.batch import BatchError, run_batch
 from magnet_search.config import ConfigError, load_config
+from magnet_search.download import Aria2cDownloader, DownloadError, DownloadResult, run_download_batch
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
 from magnet_search.providers.configurable import JsonHttpProvider
 from magnet_search.providers.internet_archive import InternetArchiveProvider
 from magnet_search.providers.manager import SearchService
+from magnet_search.storage import S3Uploader, UploadConfigError, UploadError, load_s3_upload_config
 
 
 app = typer.Typer(help="Search legal/public and user-configured magnet resources.")
@@ -33,6 +35,14 @@ def build_search_service() -> SearchService:
         if provider_config.enabled
     )
     return SearchService(providers)
+
+
+def build_downloader() -> Aria2cDownloader:
+    return Aria2cDownloader()
+
+
+def build_s3_uploader(upload_config_path: Path) -> S3Uploader:
+    return S3Uploader(load_s3_upload_config(upload_config_path))
 
 
 def _print_error(error: Exception) -> None:
@@ -84,6 +94,22 @@ def _render_table(results: list[SearchResult]) -> None:
     console.print(table)
 
 
+def _is_csv_batch_source(source: str) -> bool:
+    path = Path(source)
+    return path.exists() and path.suffix.lower() == ".csv"
+
+
+def _upload_download_results(
+    uploader: S3Uploader,
+    results: list[DownloadResult],
+    output_dir: Path,
+) -> list[str]:
+    uploaded: list[str] = []
+    for result in results:
+        uploaded.extend(uploader.upload_files(result.files, output_dir))
+    return uploaded
+
+
 @app.command()
 def search(
     query: str,
@@ -133,6 +159,34 @@ def batch(
 
     warning_printer.print_repeat_summary()
     typer.echo(f"wrote {output}")
+
+
+@app.command()
+def download(
+    source: str,
+    output: Path = typer.Option(Path("downloads"), "--output", "-o", help="Directory for downloaded files."),
+    column: str = typer.Option("magnet", help="CSV column containing magnet links."),
+    upload: Path | None = typer.Option(None, "--upload", help="S3 upload TOML config path."),
+) -> None:
+    try:
+        uploader = build_s3_uploader(upload) if upload is not None else None
+        downloader = build_downloader()
+
+        if _is_csv_batch_source(source):
+            results = run_download_batch(Path(source), column=column, output_dir=output, downloader=downloader)
+            file_count = sum(len(result.files) for result in results)
+            typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
+        else:
+            result = downloader.download(source, output)
+            results = [result]
+            typer.echo(f"downloaded {len(result.files)} file(s)")
+
+        if uploader is not None:
+            uploaded = _upload_download_results(uploader, results, output)
+            typer.echo(f"uploaded {len(uploaded)} file(s)")
+    except (DownloadError, UploadConfigError, UploadError, tomllib.TOMLDecodeError, OSError) as error:
+        _print_error(error)
+        raise typer.Exit(1) from error
 
 
 if __name__ == "__main__":

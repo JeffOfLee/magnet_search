@@ -1,0 +1,100 @@
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from magnet_search.download import Aria2cDownloader, DownloadError, run_download_batch
+
+
+class FakeRunner:
+    def __init__(self, output_dir: Path, returncode: int = 0):
+        self.output_dir = output_dir
+        self.returncode = returncode
+        self.calls = []
+
+    def __call__(self, command, capture_output, text, check):
+        self.calls.append(
+            {
+                "command": command,
+                "capture_output": capture_output,
+                "text": text,
+                "check": check,
+            }
+        )
+        if self.returncode == 0:
+            (self.output_dir / f"download-{len(self.calls)}.bin").write_text("payload", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+        return subprocess.CompletedProcess(command, self.returncode, stdout="partial", stderr="failed")
+
+
+def test_aria2c_downloader_builds_command_and_returns_downloaded_files(tmp_path: Path):
+    runner = FakeRunner(tmp_path)
+    downloader = Aria2cDownloader(runner=runner)
+
+    result = downloader.download("magnet:?xt=urn:btih:sample", tmp_path)
+
+    assert runner.calls[0]["command"] == [
+        "aria2c",
+        "--dir",
+        str(tmp_path),
+        "--seed-time=0",
+        "--summary-interval=0",
+        "magnet:?xt=urn:btih:sample",
+    ]
+    assert result.magnet == "magnet:?xt=urn:btih:sample"
+    assert [path.name for path in result.files] == ["download-1.bin"]
+
+
+def test_aria2c_downloader_rejects_empty_magnet_without_running(tmp_path: Path):
+    runner = FakeRunner(tmp_path)
+    downloader = Aria2cDownloader(runner=runner)
+
+    with pytest.raises(DownloadError, match="magnet link must be non-empty"):
+        downloader.download("   ", tmp_path)
+
+    assert runner.calls == []
+
+
+def test_aria2c_downloader_raises_when_command_fails(tmp_path: Path):
+    runner = FakeRunner(tmp_path, returncode=2)
+    downloader = Aria2cDownloader(runner=runner)
+
+    with pytest.raises(DownloadError, match="aria2c failed with exit code 2"):
+        downloader.download("magnet:?xt=urn:btih:sample", tmp_path)
+
+
+def test_run_download_batch_uses_default_magnet_column(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
+    downloader = Aria2cDownloader(runner=FakeRunner(output_dir))
+
+    results = run_download_batch(input_path, column="magnet", output_dir=output_dir, downloader=downloader)
+
+    assert [result.magnet for result in results] == [
+        "magnet:?xt=urn:btih:first",
+        "magnet:?xt=urn:btih:second",
+    ]
+
+
+def test_run_download_batch_uses_custom_column_and_skips_blank_rows(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text("link\nmagnet:?xt=urn:btih:first\n   \nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
+    downloader = Aria2cDownloader(runner=FakeRunner(output_dir))
+
+    results = run_download_batch(input_path, column="link", output_dir=output_dir, downloader=downloader)
+
+    assert [result.magnet for result in results] == [
+        "magnet:?xt=urn:btih:first",
+        "magnet:?xt=urn:btih:second",
+    ]
+
+
+def test_run_download_batch_rejects_missing_column(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("link\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
+    downloader = Aria2cDownloader(runner=FakeRunner(tmp_path / "downloads"))
+
+    with pytest.raises(DownloadError, match="missing column: magnet"):
+        run_download_batch(input_path, column="magnet", output_dir=tmp_path / "downloads", downloader=downloader)
