@@ -38,8 +38,8 @@ def build_search_service() -> SearchService:
     return SearchService(providers)
 
 
-def build_downloader() -> Aria2cDownloader:
-    return Aria2cDownloader()
+def build_downloader(verbose: bool = False) -> Aria2cDownloader:
+    return Aria2cDownloader(verbose=verbose)
 
 
 def build_s3_uploader(upload_config_path: Path) -> S3Uploader:
@@ -228,7 +228,7 @@ def download(
 ) -> None:
     try:
         uploader = build_s3_uploader(upload) if upload is not None else None
-        downloader = build_downloader()
+        downloader = build_downloader(verbose=verbose)
         is_batch = _is_csv_batch_source(source)
         mode = "batch" if is_batch else "single"
         _verbose(

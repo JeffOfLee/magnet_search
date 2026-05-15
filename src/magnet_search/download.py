@@ -50,8 +50,9 @@ def _resolve_download_source(source: str, base_dir: Path | None = None) -> str:
 
 
 class Aria2cDownloader:
-    def __init__(self, runner: Runner | None = None):
+    def __init__(self, runner: Runner | None = None, verbose: bool = False):
         self.runner = runner or subprocess.run
+        self.verbose = verbose
 
     def download(self, magnet: str, output_dir: Path) -> DownloadResult:
         magnet = magnet.strip()
@@ -65,11 +66,12 @@ class Aria2cDownloader:
             "--dir",
             str(output_dir),
             "--seed-time=0",
-            "--summary-interval=0",
             magnet,
         ]
+        if not self.verbose:
+            command.insert(-1, "--summary-interval=0")
         try:
-            completed = self.runner(command, capture_output=True, text=True, check=False)
+            completed = self.runner(command, capture_output=not self.verbose, text=True, check=False)
         except FileNotFoundError as error:
             raise DownloadError("aria2c executable not found") from error
 

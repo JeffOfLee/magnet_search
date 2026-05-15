@@ -64,8 +64,19 @@ def test_aria2c_downloader_builds_command_and_returns_downloaded_files(tmp_path:
         "--summary-interval=0",
         "magnet:?xt=urn:btih:sample",
     ]
+    assert runner.calls[0]["capture_output"] is True
     assert result.magnet == "magnet:?xt=urn:btih:sample"
     assert [path.name for path in result.files] == ["download-1.bin"]
+
+
+def test_aria2c_downloader_verbose_streams_aria2c_output(tmp_path: Path):
+    runner = FakeRunner(tmp_path)
+    downloader = Aria2cDownloader(runner=runner, verbose=True)
+
+    downloader.download("magnet:?xt=urn:btih:sample", tmp_path)
+
+    assert runner.calls[0]["capture_output"] is False
+    assert "--summary-interval=0" not in runner.calls[0]["command"]
 
 
 def test_aria2c_downloader_accepts_torrent_file_path(tmp_path: Path):

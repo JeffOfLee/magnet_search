@@ -284,7 +284,7 @@ def test_batch_command_deduplicates_repeated_warnings(monkeypatch, tmp_path):
 
 def test_download_command_downloads_single_magnet(monkeypatch, tmp_path):
     downloader = FakeDownloader()
-    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
 
     result = runner.invoke(
         cli.app,
@@ -298,7 +298,7 @@ def test_download_command_downloads_single_magnet(monkeypatch, tmp_path):
 
 def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, tmp_path):
     downloader = FakeDownloader()
-    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
 
@@ -314,7 +314,7 @@ def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, t
 
 def test_download_command_downloads_csv_batch_with_custom_column(monkeypatch, tmp_path):
     downloader = FakeDownloader()
-    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
     input_path = tmp_path / "input.csv"
     input_path.write_text("link\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
 
@@ -331,7 +331,7 @@ def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_
     captured = {}
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
-    monkeypatch.setattr(cli, "build_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
 
     def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
         captured["download_concurrency"] = download_concurrency
@@ -361,7 +361,7 @@ def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch,
     upload_path = tmp_path / "s3-upload.toml"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
     uploader = TrackingUploader()
-    monkeypatch.setattr(cli, "build_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
 
     def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
@@ -400,7 +400,7 @@ def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tm
     uploader = FakeUploader()
     upload_path = tmp_path / "s3-upload.toml"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
-    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
 
     result = runner.invoke(
@@ -426,7 +426,7 @@ def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path
     upload_path = tmp_path / "s3-upload.toml"
     output_path = tmp_path / "downloads"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
-    monkeypatch.setattr(cli, "build_downloader", lambda: downloader)
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
 
     result = runner.invoke(
@@ -450,12 +450,31 @@ def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path
     assert "verbose upload completed files=1" in result.stderr
 
 
+def test_download_command_passes_verbose_to_downloader_factory(monkeypatch, tmp_path):
+    captured = {}
+    downloader = FakeDownloader()
+
+    def fake_build_downloader(verbose=False):
+        captured["verbose"] = verbose
+        return downloader
+
+    monkeypatch.setattr(cli, "build_downloader", fake_build_downloader)
+
+    result = runner.invoke(
+        cli.app,
+        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "downloads"), "--verbose"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["verbose"] is True
+
+
 def test_download_command_exits_cleanly_on_download_error(monkeypatch, tmp_path):
     class FailingDownloader:
         def download(self, magnet, output_dir):
             raise DownloadError("download failed")
 
-    monkeypatch.setattr(cli, "build_downloader", lambda: FailingDownloader())
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FailingDownloader())
 
     result = runner.invoke(
         cli.app,
@@ -469,7 +488,7 @@ def test_download_command_exits_cleanly_on_download_error(monkeypatch, tmp_path)
 
 
 def test_download_command_exits_cleanly_on_upload_config_error(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli, "build_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
 
     def fail_upload(path):
         raise UploadConfigError("bad upload config")
