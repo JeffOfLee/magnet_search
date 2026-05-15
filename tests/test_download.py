@@ -45,6 +45,18 @@ def test_aria2c_downloader_builds_command_and_returns_downloaded_files(tmp_path:
     assert [path.name for path in result.files] == ["download-1.bin"]
 
 
+def test_aria2c_downloader_accepts_torrent_file_path(tmp_path: Path):
+    torrent_path = tmp_path / "movie.torrent"
+    torrent_path.write_text("torrent payload", encoding="utf-8")
+    runner = FakeRunner(tmp_path)
+    downloader = Aria2cDownloader(runner=runner)
+
+    result = downloader.download(str(torrent_path), tmp_path)
+
+    assert runner.calls[0]["command"][-1] == str(torrent_path)
+    assert result.magnet == str(torrent_path)
+
+
 def test_aria2c_downloader_rejects_empty_magnet_without_running(tmp_path: Path):
     runner = FakeRunner(tmp_path)
     downloader = Aria2cDownloader(runner=runner)
@@ -89,6 +101,25 @@ def test_run_download_batch_uses_custom_column_and_skips_blank_rows(tmp_path: Pa
         "magnet:?xt=urn:btih:first",
         "magnet:?xt=urn:btih:second",
     ]
+
+
+def test_run_download_batch_resolves_relative_torrent_paths_from_csv_directory(tmp_path: Path):
+    csv_dir = tmp_path / "lists"
+    csv_dir.mkdir()
+    torrent_dir = csv_dir / "torrents"
+    torrent_dir.mkdir()
+    torrent_path = torrent_dir / "movie.torrent"
+    torrent_path.write_text("torrent payload", encoding="utf-8")
+    input_path = csv_dir / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text("source\ntorrents/movie.torrent\n", encoding="utf-8")
+    runner = FakeRunner(output_dir)
+    downloader = Aria2cDownloader(runner=runner)
+
+    results = run_download_batch(input_path, column="source", output_dir=output_dir, downloader=downloader)
+
+    assert runner.calls[0]["command"][-1] == str(torrent_path)
+    assert results[0].magnet == str(torrent_path)
 
 
 def test_run_download_batch_rejects_missing_column(tmp_path: Path):

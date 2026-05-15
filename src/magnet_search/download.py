@@ -37,6 +37,16 @@ def _changed_files(before: dict[Path, tuple[int, int]], after: dict[Path, tuple[
     )
 
 
+def _resolve_download_source(source: str, base_dir: Path | None = None) -> str:
+    source = source.strip()
+    path = Path(source)
+    if path.suffix.lower() == ".torrent" and not path.is_absolute() and base_dir is not None:
+        candidate = base_dir / path
+        if candidate.exists():
+            return str(candidate)
+    return source
+
+
 class Aria2cDownloader:
     def __init__(self, runner: Runner | None = None):
         self.runner = runner or subprocess.run
@@ -94,8 +104,8 @@ def run_download_batch(
 
         results: list[DownloadResult] = []
         for row in reader:
-            magnet = row.get(column, "")
-            if not magnet.strip():
+            source = row.get(column, "")
+            if not source.strip():
                 continue
-            results.append(downloader.download(magnet, output_dir))
+            results.append(downloader.download(_resolve_download_source(source, input_path.parent), output_dir))
         return results
