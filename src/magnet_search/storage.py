@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,8 +62,12 @@ class S3Uploader:
         uploaded: list[str] = []
         for file_path in files:
             key = self._object_key(file_path, base_dir)
+            content_type, _ = mimetypes.guess_type(str(file_path))
+            extra_args = {}
+            if content_type:
+                extra_args["ContentType"] = content_type
             try:
-                self.client.upload_file(str(file_path), self.config.bucket, key)
+                self.client.upload_file(str(file_path), self.config.bucket, key, ExtraArgs=extra_args)
             except Exception as error:
                 raise UploadError(f"failed to upload {file_path}: {error}") from error
             uploaded.append(f"s3://{self.config.bucket}/{key}")

@@ -18,6 +18,7 @@ from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResu
 from magnet_search.providers.configurable import JsonHttpProvider
 from magnet_search.providers.internet_archive import InternetArchiveProvider
 from magnet_search.providers.manager import SearchService
+from magnet_search.qbittorrent import QbittorrentDownloader
 from magnet_search.storage import S3Uploader, UploadConfigError, UploadError, load_s3_upload_config
 
 
@@ -224,19 +225,32 @@ def download(
     upload: Path | None = typer.Option(None, "--upload", help="S3 upload TOML config path."),
     download_concurrency: int = typer.Option(1, min=1, help="Concurrent downloads for CSV batch input."),
     upload_concurrency: int = typer.Option(1, min=1, help="Concurrent S3 uploads when --upload is provided."),
+    engine: str = typer.Option("aria2c", help="Download engine: aria2c or qbittorrent."),
+    qbittorrent_url: str = typer.Option("http://localhost:8080", help="qBittorrent Web API URL."),
+    qbittorrent_username: str = typer.Option("admin", help="qBittorrent Web API username."),
+    qbittorrent_password: str = typer.Option("", help="qBittorrent Web API password."),
     verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
 ) -> None:
     try:
         uploader = build_s3_uploader(upload) if upload is not None else None
-        downloader = build_downloader(verbose=verbose)
         is_batch = _is_csv_batch_source(source)
         mode = "batch" if is_batch else "single"
+
+        if engine == "qbittorrent":
+            downloader = QbittorrentDownloader(
+                url=qbittorrent_url,
+                username=qbittorrent_username,
+                password=qbittorrent_password,
+            )
+        else:
+            downloader = build_downloader(verbose=verbose)
+
         _verbose(
             verbose,
             (
                 f"download mode={mode} source={source} output={output} "
                 f"download_concurrency={download_concurrency} upload_config={upload} "
-                f"upload_concurrency={upload_concurrency}"
+                f"upload_concurrency={upload_concurrency} engine={engine}"
             ),
         )
 

@@ -9,7 +9,7 @@ class FakeS3Client:
     def __init__(self):
         self.uploads = []
 
-    def upload_file(self, filename, bucket, key):
+    def upload_file(self, filename, bucket, key, ExtraArgs=None):
         self.uploads.append((filename, bucket, key))
 
 

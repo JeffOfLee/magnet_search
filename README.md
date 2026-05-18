@@ -59,9 +59,16 @@ The provider response must be JSON. Dot paths such as `data.results` are support
 
 ## Downloading Torrent Content
 
-The `download` command uses the local `aria2c` executable to download magnet links and BT `.torrent` files. Install aria2 before running downloads.
+The `download` command supports two engines:
 
-The command accepts a single magnet link, a single `.torrent` file, or a CSV path:
+| Engine | Default | Description |
+|--------|---------|-------------|
+| `aria2c` | Yes | Uses the local `aria2c` executable |
+| `qbittorrent` | No | Uses a running qBittorrent instance via Web API |
+
+### aria2c (default)
+
+Install aria2 before running downloads. The `download` command accepts a single magnet link, a single `.torrent` file, or a CSV path:
 
 ```bash
 magnet-search download "magnet:?xt=..." --output downloads/
@@ -69,6 +76,18 @@ magnet-search download movie.torrent --output downloads/
 magnet-search download input.csv --output downloads/
 magnet-search download input.csv --column link --output downloads/
 magnet-search download input.csv --output downloads/ --verbose
+```
+
+### qBittorrent
+
+Requires a running qBittorrent instance with Web UI enabled. See the full setup guide at [docs/qbittorrent-setup.md](docs/qbittorrent-setup.md).
+
+```bash
+magnet-search download movie.torrent --output downloads/ --engine qbittorrent
+magnet-search download "magnet:?xt=..." --output downloads/ --engine qbittorrent \
+  --qbittorrent-url http://localhost:8080 \
+  --qbittorrent-username admin \
+  --qbittorrent-password adminadmin
 ```
 
 If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
