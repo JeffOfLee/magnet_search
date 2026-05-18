@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import subprocess
 import threading
@@ -23,6 +24,7 @@ class DownloadResult:
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 ResultCallback = Callable[[DownloadResult], None]
 BeforeDownloadCallback = Callable[[], None]
+RESULT_FIELDS = ["source", "status", "files", "error"]
 
 
 _STORAGE_SIZE_PATTERN = re.compile(r"^\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]*)\s*$")
@@ -210,6 +212,46 @@ def _failure_message(failures: list[tuple[str, Exception]]) -> str:
     return f"{len(failures)} download(s) failed: {details}"
 
 
+class _ResultRecorder:
+    def __init__(self, result_path: Path):
+        self.result_path = result_path
+        self.result_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.result_path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=RESULT_FIELDS)
+        self._writer.writeheader()
+        self._file.flush()
+
+    def __enter__(self) -> _ResultRecorder:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self._file.close()
+
+    def record_success(self, result: DownloadResult) -> None:
+        self._write(
+            {
+                "source": result.magnet,
+                "status": "success",
+                "files": json.dumps([str(path) for path in result.files]),
+                "error": "",
+            }
+        )
+
+    def record_failure(self, source: str, error: Exception) -> None:
+        self._write(
+            {
+                "source": source,
+                "status": "failed",
+                "files": "[]",
+                "error": str(error),
+            }
+        )
+
+    def _write(self, row: dict[str, str]) -> None:
+        self._writer.writerow(row)
+        self._file.flush()
+
+
 def run_download_batch(
     input_path: Path,
     column: str,
@@ -218,6 +260,7 @@ def run_download_batch(
     download_concurrency: int = 1,
     on_result: ResultCallback | None = None,
     before_download: BeforeDownloadCallback | None = None,
+    result_path: Path | None = None,
 ) -> list[DownloadResult]:
     if download_concurrency < 1:
         raise DownloadError("download_concurrency must be at least 1")
@@ -235,42 +278,86 @@ def run_download_batch(
         results: list[DownloadResult] = []
         failures: list[tuple[str, Exception]] = []
 
-        if download_concurrency == 1:
-            for source in sources:
-                try:
-                    if before_download is not None:
-                        before_download()
-                    result = downloader.download(source, output_dir)
-                except Exception as error:
-                    failures.append((source, error))
-                    continue
-                results.append(result)
-                if on_result is not None:
-                    on_result(result)
-        else:
-            def download_source(source: str) -> DownloadResult:
+        recorder_context = _ResultRecorder(result_path) if result_path is not None else None
+        if recorder_context is None:
+            return _run_downloads(
+                sources,
+                output_dir,
+                downloader,
+                download_concurrency,
+                on_result,
+                before_download,
+                failures,
+                results,
+            )
+
+        with recorder_context as recorder:
+            return _run_downloads(
+                sources,
+                output_dir,
+                downloader,
+                download_concurrency,
+                on_result,
+                before_download,
+                failures,
+                results,
+                recorder,
+            )
+
+
+def _run_downloads(
+    sources: list[str],
+    output_dir: Path,
+    downloader: Any,
+    download_concurrency: int,
+    on_result: ResultCallback | None,
+    before_download: BeforeDownloadCallback | None,
+    failures: list[tuple[str, Exception]],
+    results: list[DownloadResult],
+    recorder: _ResultRecorder | None = None,
+) -> list[DownloadResult]:
+    if download_concurrency == 1:
+        for source in sources:
+            try:
                 if before_download is not None:
                     before_download()
-                return downloader.download(source, output_dir)
+                result = downloader.download(source, output_dir)
+            except Exception as error:
+                failures.append((source, error))
+                if recorder is not None:
+                    recorder.record_failure(source, error)
+                continue
+            results.append(result)
+            if recorder is not None:
+                recorder.record_success(result)
+            if on_result is not None:
+                on_result(result)
+    else:
 
-            with ThreadPoolExecutor(max_workers=download_concurrency) as executor:
-                futures = {
-                    executor.submit(download_source, source): (index, source)
-                    for index, source in enumerate(sources)
-                }
-                indexed_results: list[tuple[int, DownloadResult]] = []
-                for future in as_completed(futures):
-                    index, source = futures[future]
-                    try:
-                        result = future.result()
-                    except Exception as error:
-                        failures.append((source, error))
-                        continue
-                    indexed_results.append((index, result))
-                    if on_result is not None:
-                        on_result(result)
-                results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+        def download_source(source: str) -> DownloadResult:
+            if before_download is not None:
+                before_download()
+            return downloader.download(source, output_dir)
 
-        if failures:
-            raise DownloadError(_failure_message(failures))
-        return results
+        with ThreadPoolExecutor(max_workers=download_concurrency) as executor:
+            futures = {executor.submit(download_source, source): (index, source) for index, source in enumerate(sources)}
+            indexed_results: list[tuple[int, DownloadResult]] = []
+            for future in as_completed(futures):
+                index, source = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:
+                    failures.append((source, error))
+                    if recorder is not None:
+                        recorder.record_failure(source, error)
+                    continue
+                indexed_results.append((index, result))
+                if recorder is not None:
+                    recorder.record_success(result)
+                if on_result is not None:
+                    on_result(result)
+            results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
+
+    if failures:
+        raise DownloadError(_failure_message(failures))
+    return results

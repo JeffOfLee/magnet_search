@@ -195,20 +195,20 @@ All settings go in `qBittorrent.conf` under the `[Preferences]` section:
 
 ```bash
 # Basic usage with defaults (localhost:8080, admin, no password)
-magnet-search download movie.torrent --output downloads/ --engine qbittorrent
+magnet-search download movie.torrent --storage downloads/ --engine qbittorrent
 
 # With custom connection
-magnet-search download movie.torrent --output downloads/ --engine qbittorrent \
+magnet-search download movie.torrent --storage downloads/ --engine qbittorrent \
   --qbittorrent-url http://192.168.1.100:8080 \
   --qbittorrent-username admin \
   --qbittorrent-password mypassword
 
 # With S3 upload after download
-magnet-search download movie.torrent --output downloads/ --engine qbittorrent \
+magnet-search download movie.torrent --storage downloads/ --engine qbittorrent \
   --upload s3-upload.toml
 
 # With magnet link
-magnet-search download "magnet:?xt=urn:btih:..." --output downloads/ --engine qbittorrent
+magnet-search download "magnet:?xt=urn:btih:..." --storage downloads/ --engine qbittorrent
 ```
 
 ## Troubleshooting

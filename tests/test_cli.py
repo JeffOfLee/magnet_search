@@ -288,12 +288,22 @@ def test_download_command_downloads_single_magnet(monkeypatch, tmp_path):
 
     result = runner.invoke(
         cli.app,
-        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "downloads")],
+        ["download", "magnet:?xt=urn:btih:sample", "--storage", str(tmp_path / "downloads")],
     )
 
     assert result.exit_code == 0
     assert downloader.calls == [("magnet:?xt=urn:btih:sample", tmp_path / "downloads")]
     assert "downloaded 1 file(s)" in result.stdout
+
+
+def test_download_command_rejects_output_for_single_download(tmp_path):
+    result = runner.invoke(
+        cli.app,
+        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "result.csv")],
+    )
+
+    assert result.exit_code == 1
+    assert "--output is only supported for CSV batch downloads" in result.stderr
 
 
 def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, tmp_path):
@@ -302,7 +312,7 @@ def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, t
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
 
-    result = runner.invoke(cli.app, ["download", str(input_path), "--output", str(tmp_path / "downloads")])
+    result = runner.invoke(cli.app, ["download", str(input_path), "--storage", str(tmp_path / "downloads")])
 
     assert result.exit_code == 0
     assert [call[0] for call in downloader.calls] == [
@@ -310,6 +320,39 @@ def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, t
         "magnet:?xt=urn:btih:second",
     ]
     assert "downloaded 2 item(s), 2 file(s)" in result.stdout
+
+
+def test_download_command_writes_batch_result_csv(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
+    input_path = tmp_path / "input.csv"
+    result_path = tmp_path / "results" / "download-results.csv"
+    storage_path = tmp_path / "downloads"
+    input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--output",
+            str(result_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    with result_path.open(newline="", encoding="utf-8") as result_file:
+        rows = list(csv.DictReader(result_file))
+    assert rows == [
+        {
+            "source": "magnet:?xt=urn:btih:first",
+            "status": "success",
+            "files": json.dumps([str(storage_path / "movie.mp4")]),
+            "error": "",
+        }
+    ]
 
 
 def test_download_command_downloads_csv_batch_with_custom_column(monkeypatch, tmp_path):
@@ -320,7 +363,7 @@ def test_download_command_downloads_csv_batch_with_custom_column(monkeypatch, tm
 
     result = runner.invoke(
         cli.app,
-        ["download", str(input_path), "--column", "link", "--output", str(tmp_path / "downloads")],
+        ["download", str(input_path), "--column", "link", "--storage", str(tmp_path / "downloads")],
     )
 
     assert result.exit_code == 0
@@ -344,7 +387,7 @@ def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_
         [
             "download",
             str(input_path),
-            "--output",
+            "--storage",
             str(tmp_path / "downloads"),
             "--download-concurrency",
             "3",
@@ -380,7 +423,7 @@ def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch,
         [
             "download",
             str(input_path),
-            "--output",
+            "--storage",
             str(tmp_path / "downloads"),
             "--upload",
             str(upload_path),
@@ -401,7 +444,7 @@ def test_download_command_rejects_transfer_cache_storage_without_upload(tmp_path
         [
             "download",
             "magnet:?xt=urn:btih:sample",
-            "--output",
+            "--storage",
             str(tmp_path / "downloads"),
             "--transfer-cache-storage",
             "1GB",
@@ -440,7 +483,7 @@ def test_download_command_passes_transfer_cache_gate_to_batch(monkeypatch, tmp_p
         [
             "download",
             str(input_path),
-            "--output",
+            "--storage",
             str(tmp_path / "downloads"),
             "--upload",
             str(upload_path),
@@ -456,10 +499,10 @@ def test_download_command_passes_transfer_cache_gate_to_batch(monkeypatch, tmp_p
 def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(monkeypatch, tmp_path):
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nfirst\n", encoding="utf-8")
-    output_path = tmp_path / "downloads"
+    storage_path = tmp_path / "downloads"
     upload_path = tmp_path / "s3-upload.toml"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
-    uploaded_file = output_path / "movie.mp4"
+    uploaded_file = storage_path / "movie.mp4"
     uploader = FakeUploader()
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
@@ -489,8 +532,8 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
         [
             "download",
             str(input_path),
-            "--output",
-            str(output_path),
+            "--storage",
+            str(storage_path),
             "--upload",
             str(upload_path),
             "--transfer-cache-storage",
@@ -499,7 +542,7 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
     )
 
     assert result.exit_code == 0
-    assert uploader.calls == [([uploaded_file], output_path)]
+    assert uploader.calls == [([uploaded_file], storage_path)]
     assert not uploaded_file.exists()
     assert "uploaded 1 file(s)" in result.stdout
 
@@ -517,7 +560,7 @@ def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tm
         [
             "download",
             "magnet:?xt=urn:btih:sample",
-            "--output",
+            "--storage",
             str(tmp_path / "downloads"),
             "--upload",
             str(upload_path),
@@ -533,7 +576,7 @@ def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path
     downloader = FakeDownloader()
     uploader = FakeUploader()
     upload_path = tmp_path / "s3-upload.toml"
-    output_path = tmp_path / "downloads"
+    storage_path = tmp_path / "downloads"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
@@ -543,8 +586,8 @@ def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path
         [
             "download",
             "magnet:?xt=urn:btih:sample",
-            "--output",
-            str(output_path),
+            "--storage",
+            str(storage_path),
             "--upload",
             str(upload_path),
             "--verbose",
@@ -553,7 +596,7 @@ def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path
 
     assert result.exit_code == 0
     assert "verbose download mode=single source=magnet:?xt=urn:btih:sample" in result.stderr
-    assert f"output={output_path}" in result.stderr
+    assert f"storage={storage_path}" in result.stderr
     assert f"upload_config={upload_path}" in result.stderr
     assert "verbose download completed files=1" in result.stderr
     assert "verbose upload completed files=1" in result.stderr
@@ -571,7 +614,7 @@ def test_download_command_passes_verbose_to_downloader_factory(monkeypatch, tmp_
 
     result = runner.invoke(
         cli.app,
-        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "downloads"), "--verbose"],
+        ["download", "magnet:?xt=urn:btih:sample", "--storage", str(tmp_path / "downloads"), "--verbose"],
     )
 
     assert result.exit_code == 0
@@ -587,7 +630,7 @@ def test_download_command_exits_cleanly_on_download_error(monkeypatch, tmp_path)
 
     result = runner.invoke(
         cli.app,
-        ["download", "magnet:?xt=urn:btih:sample", "--output", str(tmp_path / "downloads")],
+        ["download", "magnet:?xt=urn:btih:sample", "--storage", str(tmp_path / "downloads")],
     )
 
     assert result.exit_code == 1
@@ -609,7 +652,7 @@ def test_download_command_exits_cleanly_on_upload_config_error(monkeypatch, tmp_
         [
             "download",
             "magnet:?xt=urn:btih:sample",
-            "--output",
+            "--storage",
             str(tmp_path / "downloads"),
             "--upload",
             str(tmp_path / "missing.toml"),

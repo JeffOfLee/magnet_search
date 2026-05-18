@@ -233,7 +233,8 @@ def batch(
 @app.command()
 def download(
     source: str,
-    output: Path = typer.Option(Path("downloads"), "--output", "-o", help="Directory for downloaded files."),
+    storage: Path = typer.Option(Path("downloads"), "--storage", help="Directory for downloaded files and cache."),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Batch result CSV path."),
     column: str = typer.Option("magnet", help="CSV column containing magnet links."),
     upload: Path | None = typer.Option(None, "--upload", help="S3 upload TOML config path."),
     download_concurrency: int = typer.Option(1, min=1, help="Concurrent downloads for CSV batch input."),
@@ -262,6 +263,9 @@ def download(
         uploader = build_s3_uploader(upload) if upload is not None else None
         is_batch = _is_csv_batch_source(source)
         mode = "batch" if is_batch else "single"
+        if output is not None and not is_batch:
+            _print_error(ValueError("--output is only supported for CSV batch downloads"))
+            raise typer.Exit(1)
 
         if engine == "qbittorrent":
             downloader = QbittorrentDownloader(
@@ -275,7 +279,7 @@ def download(
         _verbose(
             verbose,
             (
-                f"download mode={mode} source={source} output={output} "
+                f"download mode={mode} source={source} storage={storage} output={output} "
                 f"download_concurrency={download_concurrency} upload_config={upload} "
                 f"upload_concurrency={upload_concurrency} "
                 f"transfer_cache_storage={transfer_cache_storage} engine={engine}"
@@ -284,18 +288,21 @@ def download(
 
         if uploader is None:
             if is_batch:
-                results = run_download_batch(
-                    Path(source),
-                    column=column,
-                    output_dir=output,
-                    downloader=downloader,
-                    download_concurrency=download_concurrency,
-                )
+                batch_kwargs = {
+                    "input_path": Path(source),
+                    "column": column,
+                    "output_dir": storage,
+                    "downloader": downloader,
+                    "download_concurrency": download_concurrency,
+                }
+                if output is not None:
+                    batch_kwargs["result_path"] = output
+                results = run_download_batch(**batch_kwargs)
                 file_count = sum(len(result.files) for result in results)
                 _verbose(verbose, f"download completed items={len(results)} files={file_count}")
                 typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
             else:
-                result = downloader.download(source, output)
+                result = downloader.download(source, storage)
                 _verbose(verbose, f"download completed files={len(result.files)}")
                 typer.echo(f"downloaded {len(result.files)} file(s)")
             return
@@ -308,7 +315,7 @@ def download(
                 _verbose(verbose, f"upload enqueue source={result.magnet} files={len(result.files)}")
                 if transfer_cache is not None:
                     transfer_cache.track_result(result)
-                future = upload_executor.submit(_upload_download_result, uploader, result, output, transfer_cache)
+                future = upload_executor.submit(_upload_download_result, uploader, result, storage, transfer_cache)
                 if transfer_cache is not None:
                     future.add_done_callback(
                         lambda completed: transfer_cache.abort(completed.exception())
@@ -319,32 +326,28 @@ def download(
 
             if is_batch:
                 try:
+                    batch_kwargs = {
+                        "input_path": Path(source),
+                        "column": column,
+                        "output_dir": storage,
+                        "downloader": downloader,
+                        "download_concurrency": download_concurrency,
+                        "on_result": enqueue_upload,
+                    }
+                    if output is not None:
+                        batch_kwargs["result_path"] = output
                     if transfer_cache is None:
-                        results = run_download_batch(
-                            Path(source),
-                            column=column,
-                            output_dir=output,
-                            downloader=downloader,
-                            download_concurrency=download_concurrency,
-                            on_result=enqueue_upload,
-                        )
+                        results = run_download_batch(**batch_kwargs)
                     else:
-                        results = run_download_batch(
-                            Path(source),
-                            column=column,
-                            output_dir=output,
-                            downloader=downloader,
-                            download_concurrency=download_concurrency,
-                            on_result=enqueue_upload,
-                            before_download=transfer_cache.wait_for_space,
-                        )
+                        batch_kwargs["before_download"] = transfer_cache.wait_for_space
+                        results = run_download_batch(**batch_kwargs)
                     file_count = sum(len(result.files) for result in results)
                     _verbose(verbose, f"download completed items={len(results)} files={file_count}")
                     typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
                 except DownloadError as error:
                     download_error = error
             else:
-                result = downloader.download(source, output)
+                result = downloader.download(source, storage)
                 enqueue_upload(result)
                 _verbose(verbose, f"download completed files={len(result.files)}")
                 typer.echo(f"downloaded {len(result.files)} file(s)")

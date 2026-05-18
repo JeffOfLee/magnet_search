@@ -10,12 +10,12 @@ magnet-search search "resource name" --limit 3 --json
 magnet-search search "resource name" --limit 3 --verbose
 magnet-search search input.csv --output results.csv --limit 3
 magnet-search search input.csv --column title --output results.csv --limit 3
-magnet-search download "magnet:?xt=..." --output downloads/
-magnet-search download movie.torrent --output downloads/
-magnet-search download input.csv --output downloads/
-magnet-search download input.csv --column magnet --output downloads/ --upload s3-upload.toml
-magnet-search download input.csv --output downloads/ --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
-magnet-search download input.csv --output downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
+magnet-search download "magnet:?xt=..." --storage downloads/
+magnet-search download movie.torrent --storage downloads/
+magnet-search download input.csv --storage downloads/ --output download-results.csv
+magnet-search download input.csv --column magnet --storage downloads/ --output download-results.csv --upload s3-upload.toml
+magnet-search download input.csv --storage downloads/ --output download-results.csv --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
+magnet-search download input.csv --storage downloads/ --output download-results.csv --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
 The built-in provider targets public/legal metadata. The tool does not include built-in piracy or gray-market sources. Additional providers can be configured by the user in TOML.
@@ -72,11 +72,11 @@ The `download` command supports two engines:
 Install aria2 before running downloads. The `download` command accepts a single magnet link, a single `.torrent` file, or a CSV path:
 
 ```bash
-magnet-search download "magnet:?xt=..." --output downloads/
-magnet-search download movie.torrent --output downloads/
-magnet-search download input.csv --output downloads/
-magnet-search download input.csv --column link --output downloads/
-magnet-search download input.csv --output downloads/ --verbose
+magnet-search download "magnet:?xt=..." --storage downloads/
+magnet-search download movie.torrent --storage downloads/
+magnet-search download input.csv --storage downloads/ --output download-results.csv
+magnet-search download input.csv --column link --storage downloads/ --output download-results.csv
+magnet-search download input.csv --storage downloads/ --output download-results.csv --verbose
 ```
 
 ### qBittorrent
@@ -84,8 +84,8 @@ magnet-search download input.csv --output downloads/ --verbose
 Requires a running qBittorrent instance with Web UI enabled. See the full setup guide at [docs/qbittorrent-setup.md](docs/qbittorrent-setup.md).
 
 ```bash
-magnet-search download movie.torrent --output downloads/ --engine qbittorrent
-magnet-search download "magnet:?xt=..." --output downloads/ --engine qbittorrent \
+magnet-search download movie.torrent --storage downloads/ --engine qbittorrent
+magnet-search download "magnet:?xt=..." --storage downloads/ --engine qbittorrent \
   --qbittorrent-url http://localhost:8080 \
   --qbittorrent-username admin \
   --qbittorrent-password adminadmin
@@ -93,12 +93,14 @@ magnet-search download "magnet:?xt=..." --output downloads/ --engine qbittorrent
 
 If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
 
+For `download`, `--storage` is the local download/cache directory. In CSV batch mode, `--output` writes a real-time CSV result log with `source`, `status`, `files`, and `error` columns.
+
 To upload downloaded files to S3 after the local download completes, pass an upload config file:
 
 ```bash
-magnet-search download input.csv --output downloads/ --upload s3-upload.toml
-magnet-search download input.csv --output downloads/ --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
-magnet-search download input.csv --output downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
+magnet-search download input.csv --storage downloads/ --output download-results.csv --upload s3-upload.toml
+magnet-search download input.csv --storage downloads/ --output download-results.csv --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
+magnet-search download input.csv --storage downloads/ --output download-results.csv --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
 `--download-concurrency` controls how many CSV batch rows can download at the same time. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Both default to `1`.

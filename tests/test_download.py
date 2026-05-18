@@ -1,6 +1,8 @@
 import subprocess
 import threading
 import time
+import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -182,6 +184,67 @@ def test_run_download_batch_respects_download_concurrency(tmp_path: Path):
 
     assert len(results) == 4
     assert downloader.max_active == 2
+
+
+def test_run_download_batch_records_results_as_each_item_finishes(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    result_path = tmp_path / "results" / "download-results.csv"
+    input_path.write_text("magnet\nfirst\nsecond\nbad\n", encoding="utf-8")
+    observed_rows: list[list[dict[str, str]]] = []
+
+    class ObservingDownloader:
+        def download(self, source: str, output_dir: Path):
+            if source == "bad":
+                raise DownloadError("bad failed")
+            file_path = output_dir / f"{source}.bin"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("payload", encoding="utf-8")
+            if result_path.exists():
+                with result_path.open(newline="", encoding="utf-8") as result_file:
+                    observed_rows.append(list(csv.DictReader(result_file)))
+            return DownloadResult(magnet=source, files=[file_path])
+
+    with pytest.raises(DownloadError, match="bad failed"):
+        run_download_batch(
+            input_path,
+            column="magnet",
+            output_dir=output_dir,
+            downloader=ObservingDownloader(),
+            result_path=result_path,
+        )
+
+    assert result_path.exists()
+    assert observed_rows == [
+        [],
+        [
+            {
+                "source": "first",
+                "status": "success",
+                "files": json.dumps([str(output_dir / "first.bin")]),
+                "error": "",
+            }
+        ],
+    ]
+
+    with result_path.open(newline="", encoding="utf-8") as result_file:
+        rows = list(csv.DictReader(result_file))
+
+    assert rows == [
+        {
+            "source": "first",
+            "status": "success",
+            "files": json.dumps([str(output_dir / "first.bin")]),
+            "error": "",
+        },
+        {
+            "source": "second",
+            "status": "success",
+            "files": json.dumps([str(output_dir / "second.bin")]),
+            "error": "",
+        },
+        {"source": "bad", "status": "failed", "files": "[]", "error": "bad failed"},
+    ]
 
 
 @pytest.mark.parametrize(
