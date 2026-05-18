@@ -13,7 +13,15 @@ from rich.table import Table
 
 from magnet_search.batch import BatchError, run_batch
 from magnet_search.config import ConfigError, load_config
-from magnet_search.download import Aria2cDownloader, DownloadError, DownloadResult, run_download_batch
+from magnet_search.download import (
+    Aria2cDownloader,
+    DownloadError,
+    DownloadResult,
+    TransferCacheStorage,
+    cleanup_download_result,
+    parse_storage_size,
+    run_download_batch,
+)
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
 from magnet_search.providers.configurable import JsonHttpProvider
 from magnet_search.providers.internet_archive import InternetArchiveProvider
@@ -110,10 +118,15 @@ def _upload_download_result(
     uploader: S3Uploader,
     result: DownloadResult,
     output_dir: Path,
+    transfer_cache: TransferCacheStorage | None = None,
 ) -> list[str]:
     if not result.files:
         return []
-    return uploader.upload_files(result.files, output_dir)
+    uploaded = uploader.upload_files(result.files, output_dir)
+    if transfer_cache is not None:
+        cleanup_download_result(result, output_dir)
+        transfer_cache.release_result(result)
+    return uploaded
 
 
 def _collect_upload_futures(upload_futures: list[Future[list[str]]]) -> list[str]:
@@ -225,6 +238,11 @@ def download(
     upload: Path | None = typer.Option(None, "--upload", help="S3 upload TOML config path."),
     download_concurrency: int = typer.Option(1, min=1, help="Concurrent downloads for CSV batch input."),
     upload_concurrency: int = typer.Option(1, min=1, help="Concurrent S3 uploads when --upload is provided."),
+    transfer_cache_storage: str | None = typer.Option(
+        None,
+        "--transfer-cache-storage",
+        help="Maximum current-run local cache size before pausing new downloads, e.g. 500MB or 10GB.",
+    ),
     engine: str = typer.Option("aria2c", help="Download engine: aria2c or qbittorrent."),
     qbittorrent_url: str = typer.Option("http://localhost:8080", help="qBittorrent Web API URL."),
     qbittorrent_username: str = typer.Option("admin", help="qBittorrent Web API username."),
@@ -232,6 +250,15 @@ def download(
     verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
 ) -> None:
     try:
+        if transfer_cache_storage is not None and upload is None:
+            _print_error(ValueError("--transfer-cache-storage requires --upload"))
+            raise typer.Exit(1)
+
+        transfer_cache = (
+            TransferCacheStorage(parse_storage_size(transfer_cache_storage))
+            if transfer_cache_storage is not None
+            else None
+        )
         uploader = build_s3_uploader(upload) if upload is not None else None
         is_batch = _is_csv_batch_source(source)
         mode = "batch" if is_batch else "single"
@@ -250,7 +277,8 @@ def download(
             (
                 f"download mode={mode} source={source} output={output} "
                 f"download_concurrency={download_concurrency} upload_config={upload} "
-                f"upload_concurrency={upload_concurrency} engine={engine}"
+                f"upload_concurrency={upload_concurrency} "
+                f"transfer_cache_storage={transfer_cache_storage} engine={engine}"
             ),
         )
 
@@ -278,18 +306,38 @@ def download(
 
             def enqueue_upload(result: DownloadResult) -> None:
                 _verbose(verbose, f"upload enqueue source={result.magnet} files={len(result.files)}")
-                upload_futures.append(upload_executor.submit(_upload_download_result, uploader, result, output))
+                if transfer_cache is not None:
+                    transfer_cache.track_result(result)
+                future = upload_executor.submit(_upload_download_result, uploader, result, output, transfer_cache)
+                if transfer_cache is not None:
+                    future.add_done_callback(
+                        lambda completed: transfer_cache.abort(completed.exception())
+                        if completed.exception() is not None
+                        else None
+                    )
+                upload_futures.append(future)
 
             if is_batch:
                 try:
-                    results = run_download_batch(
-                        Path(source),
-                        column=column,
-                        output_dir=output,
-                        downloader=downloader,
-                        download_concurrency=download_concurrency,
-                        on_result=enqueue_upload,
-                    )
+                    if transfer_cache is None:
+                        results = run_download_batch(
+                            Path(source),
+                            column=column,
+                            output_dir=output,
+                            downloader=downloader,
+                            download_concurrency=download_concurrency,
+                            on_result=enqueue_upload,
+                        )
+                    else:
+                        results = run_download_batch(
+                            Path(source),
+                            column=column,
+                            output_dir=output,
+                            downloader=downloader,
+                            download_concurrency=download_concurrency,
+                            on_result=enqueue_upload,
+                            before_download=transfer_cache.wait_for_space,
+                        )
                     file_count = sum(len(result.files) for result in results)
                     _verbose(verbose, f"download completed items={len(results)} files={file_count}")
                     typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")

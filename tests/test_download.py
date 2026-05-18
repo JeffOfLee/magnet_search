@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from magnet_search.download import Aria2cDownloader, DownloadError, run_download_batch
+from magnet_search.download import (
+    Aria2cDownloader,
+    DownloadError,
+    DownloadResult,
+    TransferCacheStorage,
+    parse_storage_size,
+    run_download_batch,
+)
 
 
 class FakeRunner:
@@ -175,6 +182,103 @@ def test_run_download_batch_respects_download_concurrency(tmp_path: Path):
 
     assert len(results) == 4
     assert downloader.max_active == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1024", 1024),
+        ("500MB", 500_000_000),
+        ("2GB", 2_000_000_000),
+        ("1.5GiB", 1_610_612_736),
+    ],
+)
+def test_parse_storage_size_accepts_bytes_and_units(raw: str, expected: int):
+    assert parse_storage_size(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "0", "-1MB", "tenGB", "1XB"])
+def test_parse_storage_size_rejects_invalid_values(raw: str):
+    with pytest.raises(DownloadError):
+        parse_storage_size(raw)
+
+
+def test_transfer_cache_storage_waits_until_tracked_result_is_released(tmp_path: Path):
+    file_path = tmp_path / "movie.bin"
+    file_path.write_text("payload", encoding="utf-8")
+    result = DownloadResult(magnet="first", files=[file_path])
+    cache = TransferCacheStorage(limit_bytes=3)
+    cache.track_result(result)
+    released: list[bool] = []
+
+    thread = threading.Thread(target=lambda: (cache.wait_for_space(), released.append(True)))
+    thread.start()
+    time.sleep(0.05)
+
+    assert released == []
+
+    cache.release_result(result)
+    thread.join(timeout=1)
+
+    assert released == [True]
+
+
+def test_run_download_batch_waits_for_transfer_cache_space_before_next_download(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text("magnet\nfirst\nsecond\n", encoding="utf-8")
+    cache = TransferCacheStorage(limit_bytes=3)
+    results_by_source: dict[str, DownloadResult] = {}
+    errors: list[Exception] = []
+
+    class WritingDownloader:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.lock = threading.Lock()
+
+        def download(self, source: str, output_dir: Path):
+            with self.lock:
+                self.calls.append(source)
+            file_path = output_dir / f"{source}.bin"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("payload", encoding="utf-8")
+            return DownloadResult(magnet=source, files=[file_path])
+
+    downloader = WritingDownloader()
+
+    def on_result(result: DownloadResult) -> None:
+        results_by_source[result.magnet] = result
+        cache.track_result(result)
+
+    def run_batch() -> None:
+        try:
+            run_download_batch(
+                input_path,
+                column="magnet",
+                output_dir=output_dir,
+                downloader=downloader,
+                download_concurrency=1,
+                on_result=on_result,
+                before_download=cache.wait_for_space,
+            )
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run_batch)
+    thread.start()
+    for _ in range(50):
+        if "first" in results_by_source:
+            break
+        time.sleep(0.01)
+
+    time.sleep(0.05)
+    assert downloader.calls == ["first"]
+
+    cache.release_result(results_by_source["first"])
+    thread.join(timeout=1)
+
+    assert errors == []
+    assert downloader.calls == ["first", "second"]
 
 
 def test_run_download_batch_aggregates_download_failures(tmp_path: Path):

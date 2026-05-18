@@ -15,6 +15,7 @@ magnet-search download movie.torrent --output downloads/
 magnet-search download input.csv --output downloads/
 magnet-search download input.csv --column magnet --output downloads/ --upload s3-upload.toml
 magnet-search download input.csv --output downloads/ --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
+magnet-search download input.csv --output downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
 The built-in provider targets public/legal metadata. The tool does not include built-in piracy or gray-market sources. Additional providers can be configured by the user in TOML.
@@ -97,9 +98,12 @@ To upload downloaded files to S3 after the local download completes, pass an upl
 ```bash
 magnet-search download input.csv --output downloads/ --upload s3-upload.toml
 magnet-search download input.csv --output downloads/ --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
+magnet-search download input.csv --output downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
 `--download-concurrency` controls how many CSV batch rows can download at the same time. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Both default to `1`.
+
+`--transfer-cache-storage` limits the current-run local transfer cache before starting new batch downloads. It accepts sizes such as `500MB`, `10GB`, and `1.5GiB`, and requires `--upload`. When the tracked downloaded files exceed the limit, new downloads wait until a completed upload deletes its local files and releases cache space. Downloads already in progress are allowed to finish, so cache usage can temporarily exceed the limit.
 
 Add `--verbose` to print detailed process logs to stderr. Normal stdout remains unchanged, so JSON output and CSV file outputs stay parseable.
 

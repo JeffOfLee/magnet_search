@@ -395,6 +395,115 @@ def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch,
     assert "uploaded 4 file(s)" in result.stdout
 
 
+def test_download_command_rejects_transfer_cache_storage_without_upload(tmp_path):
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            "magnet:?xt=urn:btih:sample",
+            "--output",
+            str(tmp_path / "downloads"),
+            "--transfer-cache-storage",
+            "1GB",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--transfer-cache-storage requires --upload" in result.stderr
+
+
+def test_download_command_passes_transfer_cache_gate_to_batch(monkeypatch, tmp_path):
+    captured = {}
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\n", encoding="utf-8")
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: FakeUploader())
+
+    def fake_run_download_batch(
+        input_path,
+        column,
+        output_dir,
+        downloader,
+        download_concurrency,
+        on_result=None,
+        before_download=None,
+    ):
+        captured["before_download"] = before_download
+        return []
+
+    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--output",
+            str(tmp_path / "downloads"),
+            "--upload",
+            str(upload_path),
+            "--transfer-cache-storage",
+            "1MB",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert callable(captured["before_download"])
+
+
+def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\n", encoding="utf-8")
+    output_path = tmp_path / "downloads"
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploaded_file = output_path / "movie.mp4"
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+
+    def fake_run_download_batch(
+        input_path,
+        column,
+        output_dir,
+        downloader,
+        download_concurrency,
+        on_result=None,
+        before_download=None,
+    ):
+        if before_download is not None:
+            before_download()
+        uploaded_file.parent.mkdir(parents=True, exist_ok=True)
+        uploaded_file.write_text("payload", encoding="utf-8")
+        result = cli.DownloadResult(magnet="first", files=[uploaded_file])
+        if on_result is not None:
+            on_result(result)
+        return [result]
+
+    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--upload",
+            str(upload_path),
+            "--transfer-cache-storage",
+            "1MB",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert uploader.calls == [([uploaded_file], output_path)]
+    assert not uploaded_file.exists()
+    assert "uploaded 1 file(s)" in result.stdout
+
+
 def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tmp_path):
     downloader = FakeDownloader()
     uploader = FakeUploader()
