@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from magnet_search import cli
 from magnet_search.config import ConfigError
 from magnet_search.download import DOWNLOAD_RECORD_FILENAME, DownloadError
+from magnet_search.qbittorrent import QbittorrentDownloadStatus
 from magnet_search.storage import UploadConfigError
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
 
@@ -546,6 +547,39 @@ def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_p
             "err": "",
         }
     ]
+
+
+def test_qbittorrent_monitor_renders_current_downloads_once(monkeypatch):
+    class MonitoringDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def list_downloads(self):
+            return [
+                QbittorrentDownloadStatus(
+                    name="Ubuntu ISO",
+                    state="downloading",
+                    progress=0.5,
+                    size=2_000_000,
+                    downloaded=1_000_000,
+                    download_speed=500_000,
+                    upload_speed=10_000,
+                    eta=60,
+                    seeds=7,
+                    peers=3,
+                    save_path="/downloads",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", MonitoringDownloader)
+
+    result = runner.invoke(cli.app, ["qbittorrent-monitor", "--once"])
+
+    assert result.exit_code == 0
+    assert "Ubuntu ISO" in result.stdout
+    assert "downloading" in result.stdout
+    assert "50.0%" in result.stdout
+    assert "500.0 KB/s" in result.stdout
 
 
 def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch, tmp_path):

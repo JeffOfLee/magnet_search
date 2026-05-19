@@ -359,3 +359,34 @@ def test_qbittorrent_startup_results_record_stalled_torrent_without_waiting(tmp_
     assert results[0].files == [file_path]
     hash_wait_calls = [call for call in mock_client.get.call_args_list if call.kwargs.get("params")]
     assert hash_wait_calls == []
+
+
+def test_qbittorrent_list_downloads_returns_current_status():
+    mock_client = MagicMock()
+    mock_client.post.return_value = FakeResponse("Ok.")
+    mock_client.get.return_value = FakeResponse(json_data=[
+        _make_torrent(
+            "ubuntu",
+            "downloading",
+            0.25,
+            name="Ubuntu ISO",
+            size=4_000,
+            downloaded=1_000,
+            dlspeed=512,
+            upspeed=64,
+            eta=120,
+            num_seeds=5,
+            num_leechs=2,
+            save_path="/downloads",
+        )
+    ])
+    downloader = QbittorrentDownloader()
+    downloader._session = mock_client
+
+    downloads = downloader.list_downloads()
+
+    assert downloads[0].name == "Ubuntu ISO"
+    assert downloads[0].state == "downloading"
+    assert downloads[0].progress == 0.25
+    assert downloads[0].download_speed == 512
+    assert downloads[0].seeds == 5

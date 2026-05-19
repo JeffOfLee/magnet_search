@@ -89,7 +89,14 @@ magnet-search download "magnet:?xt=..." --storage downloads/ --engine qbittorren
   --qbittorrent-url http://localhost:8080 \
   --qbittorrent-username admin \
   --qbittorrent-password adminadmin
+
+magnet-search qbittorrent-monitor \
+  --qbittorrent-url http://localhost:8080 \
+  --qbittorrent-username admin \
+  --qbittorrent-password adminadmin
 ```
+
+`qbittorrent-monitor` refreshes the current torrent list and status every 1 second by default. Use `--interval` to change the refresh period.
 
 If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; when the input is a search metadata file, the command automatically uses `result`. Use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
 

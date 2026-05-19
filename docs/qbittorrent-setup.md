@@ -246,7 +246,15 @@ magnet-search download movie.torrent --storage downloads/ --engine qbittorrent \
 
 # With magnet link
 magnet-search download "magnet:?xt=urn:btih:..." --storage downloads/ --engine qbittorrent
+
+# Monitor current qBittorrent downloads, refreshing every 1 second
+magnet-search qbittorrent-monitor \
+  --qbittorrent-url http://127.0.0.1:8080 \
+  --qbittorrent-username admin \
+  --qbittorrent-password mypassword
 ```
+
+Use `--interval` to change the monitor refresh period.
 
 ## Troubleshooting
 

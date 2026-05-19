@@ -3,11 +3,27 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
 from magnet_search.download import DownloadError, DownloadResult, _snapshot_files, _changed_files
+
+
+@dataclass(frozen=True)
+class QbittorrentDownloadStatus:
+    name: str
+    state: str
+    progress: float
+    size: int
+    downloaded: int
+    download_speed: int
+    upload_speed: int
+    eta: int
+    seeds: int
+    peers: int
+    save_path: str
 
 
 def _torrent_info_hash(data: bytes) -> str:
@@ -194,6 +210,25 @@ class QbittorrentDownloader:
         except Exception:
             return set()
 
+    def list_downloads(self) -> list[QbittorrentDownloadStatus]:
+        response = self._api_get("/api/v2/torrents/info")
+        return [self._download_status_from_torrent(torrent) for torrent in response.json()]
+
+    def _download_status_from_torrent(self, torrent: dict) -> QbittorrentDownloadStatus:
+        return QbittorrentDownloadStatus(
+            name=str(torrent.get("name", "")),
+            state=str(torrent.get("state", "")),
+            progress=_float_value(torrent.get("progress")),
+            size=_int_value(torrent.get("size")),
+            downloaded=_int_value(torrent.get("downloaded")),
+            download_speed=_int_value(torrent.get("dlspeed")),
+            upload_speed=_int_value(torrent.get("upspeed")),
+            eta=_int_value(torrent.get("eta")),
+            seeds=_int_value(torrent.get("num_seeds")),
+            peers=_int_value(torrent.get("num_leechs")),
+            save_path=str(torrent.get("save_path", "")),
+        )
+
     def startup_download_results(self, output_dir: Path) -> list[DownloadResult]:
         active_states = frozenset(("downloading", "forcedDL", "queuedDL", "metaDL", "checkingDL"))
         immediate_states = frozenset(("stalledDL",))
@@ -310,3 +345,17 @@ class QbittorrentDownloader:
             return int(seeds) <= 0 and torrent.get("progress", 0) < 1.0
         except (TypeError, ValueError):
             return False
+
+
+def _int_value(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_value(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from collections import Counter
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
 from magnet_search.batch import BatchError, run_batch
@@ -30,7 +32,7 @@ from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResu
 from magnet_search.providers.configurable import JsonHttpProvider
 from magnet_search.providers.internet_archive import InternetArchiveProvider
 from magnet_search.providers.manager import SearchService
-from magnet_search.qbittorrent import QbittorrentDownloader
+from magnet_search.qbittorrent import QbittorrentDownloader, QbittorrentDownloadStatus
 from magnet_search.storage import S3Uploader, UploadConfigError, UploadError, load_s3_upload_config
 
 
@@ -113,6 +115,67 @@ def _render_table(results: list[SearchResult]) -> None:
             result.url,
         )
     console.print(table)
+
+
+def _format_bytes(value: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1000 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1000
+    return f"{amount:.1f} TB"
+
+
+def _format_speed(value: int) -> str:
+    return f"{_format_bytes(value)}/s"
+
+
+def _format_eta(seconds: int) -> str:
+    if seconds <= 0:
+        return ""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:d}:{secs:02d}"
+
+
+def _render_qbittorrent_monitor_table(downloads: list[QbittorrentDownloadStatus]) -> Table:
+    table = Table(title="qBittorrent Downloads")
+    table.add_column("Name")
+    table.add_column("State")
+    table.add_column("Progress", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Downloaded", justify="right")
+    table.add_column("Down", justify="right")
+    table.add_column("Up", justify="right")
+    table.add_column("ETA", justify="right")
+    table.add_column("Seeds", justify="right")
+    table.add_column("Peers", justify="right")
+    table.add_column("Save Path")
+
+    if not downloads:
+        table.add_row("No downloads", "", "", "", "", "", "", "", "", "", "")
+        return table
+
+    for download in downloads:
+        table.add_row(
+            download.name,
+            download.state,
+            f"{download.progress * 100:.1f}%",
+            _format_bytes(download.size),
+            _format_bytes(download.downloaded),
+            _format_speed(download.download_speed),
+            _format_speed(download.upload_speed),
+            _format_eta(download.eta),
+            str(download.seeds),
+            str(download.peers),
+            download.save_path,
+        )
+    return table
 
 
 def _is_csv_batch_source(source: str) -> bool:
@@ -399,6 +462,36 @@ def batch(
 ) -> None:
     service = _build_search_service_or_exit()
     _run_search_batch_or_exit(input_csv, column=column, search_meta=output, limit=limit, service=service, verbose=verbose)
+
+
+@app.command("qbittorrent-monitor")
+def qbittorrent_monitor(
+    qbittorrent_url: str = typer.Option("http://localhost:8080", help="qBittorrent Web API URL."),
+    qbittorrent_username: str = typer.Option("admin", help="qBittorrent Web API username."),
+    qbittorrent_password: str = typer.Option("", help="qBittorrent Web API password."),
+    interval: float = typer.Option(1.0, "--interval", min=0.1, help="Refresh interval in seconds."),
+    once: bool = typer.Option(False, "--once", hidden=True, help="Render once and exit."),
+) -> None:
+    downloader = QbittorrentDownloader(
+        url=qbittorrent_url,
+        username=qbittorrent_username,
+        password=qbittorrent_password,
+    )
+
+    try:
+        if once:
+            console.print(_render_qbittorrent_monitor_table(downloader.list_downloads()))
+            return
+
+        with Live(console=console, refresh_per_second=4, transient=False) as live:
+            while True:
+                live.update(_render_qbittorrent_monitor_table(downloader.list_downloads()))
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        return
+    except Exception as error:
+        _print_error(error)
+        raise typer.Exit(1) from error
 
 
 @app.command()
