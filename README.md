@@ -111,7 +111,7 @@ magnet-search download downloads/.download_meta.csv --storage downloads/ --uploa
 magnet-search download input.csv --storage downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
-`--download-concurrency` controls how many CSV batch rows can download at the same time for the default `aria2c` engine. For `--engine qbittorrent`, CSV batch tasks are all submitted to qBittorrent paused first, then the unfinished torrents with the most active seeds are resumed up to `--download-concurrency`. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Download and upload have independent schedulers, connected by per-item completion events. Both default to `1`.
+`--download-concurrency` controls how many CSV batch rows can download at the same time for the default `aria2c` engine. For `--engine qbittorrent`, each CSV source first reuses any matching qBittorrent record. Missing records are submitted stopped/paused, completed records succeed immediately when the cache file is complete, completed records with missing or incomplete cache files are resubmitted, active records are attached to the scheduler, and `stalledDL` records fail immediately. The unfinished torrents with the most active seeds are started or resumed up to `--download-concurrency`. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Download and upload have independent schedulers, connected by per-item completion events. Both default to `1`.
 
 When `--upload` is provided, upload progress is written to `--upload-meta`, defaulting to `{storage}/.upload_meta.csv`. If the input CSV is a download metadata file, the command uploads the already-downloaded files from that metadata instead of downloading again.
 
@@ -125,7 +125,7 @@ When `--upload` is provided, upload progress is written to `--upload-meta`, defa
 The search, download, and upload stages can be restarted after interruption:
 
 - Search reads the existing search metadata and skips keywords that already have `status=success`.
-- Download reads the existing download metadata, skips inputs that already have `status=success`, removes failed-record residue under `--storage`, and for qBittorrent records startup `stalledDL` tasks immediately while waiting for startup `downloading` tasks to finish before writing them to download metadata.
+- Download reads the existing download metadata, skips inputs that already have `status=success`, and removes failed-record residue under `--storage`. For qBittorrent CSV batches, matching qBittorrent records are classified per input so active records can be attached, completed cache records can be reused, incomplete cache records can be redownloaded, and `stalledDL` records can fail without duplicate submission.
 - Upload reads the upload metadata and cache directory, deletes cache files already marked successful, and enqueues successful download records that still exist locally but do not yet have successful upload rows.
 
 Add `--verbose` to print detailed process logs to stderr. Normal stdout remains unchanged, so JSON output and CSV file outputs stay parseable.

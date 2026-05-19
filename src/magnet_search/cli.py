@@ -865,7 +865,7 @@ def download(
 
         startup_results: list[DownloadResult] = []
         startup_sources: set[str] = set()
-        if is_batch and not is_download_meta:
+        if is_batch and not is_download_meta and engine != "qbittorrent":
             startup_results = _record_startup_download_results(
                 _startup_download_results(downloader, storage),
                 storage,
@@ -900,7 +900,7 @@ def download(
 
         if uploader is None:
             if is_batch:
-                active_sources = _active_download_sources(downloader) | startup_sources
+                active_sources = set() if engine == "qbittorrent" else _active_download_sources(downloader) | startup_sources
                 if engine == "qbittorrent":
                     results, _ = _run_qbittorrent_seed_priority_batch(
                         Path(source),
@@ -1042,7 +1042,7 @@ def download(
                 }
                 if skip_sources:
                     batch_kwargs["skip_sources"] = skip_sources
-                active_sources = _active_download_sources(downloader)
+                active_sources = set() if engine == "qbittorrent" else _active_download_sources(downloader)
                 if active_sources:
                     batch_kwargs["skip_sources"] = set(batch_kwargs.get("skip_sources", set())) | active_sources
                 if startup_sources:

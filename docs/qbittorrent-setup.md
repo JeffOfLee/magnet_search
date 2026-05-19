@@ -9,11 +9,11 @@ The `QbittorrentDownloader` communicates with a running qBittorrent instance thr
 1. Logs in to the Web API
 2. Adds the torrent (file upload or magnet link)
 3. Polls download progress until completion
-4. Cleans up the torrent entry (keeping downloaded files)
+4. Cleans up the torrent entry for single downloads while keeping downloaded files
 
-For CSV downloads, startup recovery also inspects existing qBittorrent tasks. Existing `downloading` tasks are recorded to download metadata after they complete, and existing `stalledDL` tasks are recorded immediately so restarts do not add duplicate torrents.
+For CSV downloads, qBittorrent records are classified per input before new work is submitted. If there is no matching qBittorrent record, the source is submitted stopped/paused. If a matching record is complete and the cache file is complete, the input succeeds immediately. If the record is complete but the cache file is missing or incomplete, the record is removed from qBittorrent while keeping files and the source is submitted again. If the record is still active, the scheduler attaches to it. If the record is `stalledDL`, the input fails immediately.
 
-When `--engine qbittorrent` is used with a CSV batch, `magnet-search` submits all pending sources to qBittorrent in a stopped/paused state first. It then polls qBittorrent, sorts unfinished torrents by active seed count, and starts or resumes only the top `--download-concurrency` torrents. Lower-seed unfinished torrents stay stopped/paused until a higher-priority active download completes or fails. The control calls support both newer `start`/`stop` Web API naming and older `resume`/`pause` naming.
+When `--engine qbittorrent` is used with a CSV batch, `magnet-search` polls qBittorrent, sorts unfinished torrents by active seed count, and starts or resumes only the top `--download-concurrency` torrents. Lower-seed unfinished torrents stay stopped/paused until a higher-priority active download completes or fails. The control calls support both newer `start`/`stop` Web API naming and older `resume`/`pause` naming.
 
 When `--upload` is also provided, completed qBittorrent items are passed to the upload scheduler immediately. Uploads do not wait for the full qBittorrent batch scheduler to finish.
 

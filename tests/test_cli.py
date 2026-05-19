@@ -536,14 +536,17 @@ def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_
     assert captured["download_concurrency"] == 3
 
 
-def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path):
+def test_download_command_passes_active_qbittorrent_sources_to_scheduler(monkeypatch, tmp_path):
     captured = {}
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nactive\nfresh\n", encoding="utf-8")
 
     class ActiveDownloader(FakeDownloader):
+        def startup_download_results(self, output_dir):
+            raise AssertionError("qBittorrent startup recovery should be handled per scheduler source")
+
         def active_download_sources(self):
-            return {"active"}
+            raise AssertionError("qBittorrent active records should be handled per scheduler source")
 
         def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
             captured["sources"] = [source.input for source in sources]
@@ -564,27 +567,21 @@ def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path
     )
 
     assert result.exit_code == 0
-    assert captured["sources"] == ["fresh"]
+    assert captured["sources"] == ["active", "fresh"]
 
 
-def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_path):
+def test_download_command_lets_qbittorrent_scheduler_reuse_startup_records(monkeypatch, tmp_path):
     captured = {}
     input_path = tmp_path / "input.csv"
     storage_path = tmp_path / "downloads"
-    file_path = storage_path / "recovered.mp4"
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:recovered\nfresh\n", encoding="utf-8")
-    file_path.parent.mkdir()
-    file_path.write_text("video content", encoding="utf-8")
 
     class RecoveringDownloader(FakeDownloader):
         def startup_download_results(self, output_dir):
-            return [
-                cli.DownloadResult(
-                    magnet="magnet:?xt=urn:btih:recovered",
-                    files=[file_path],
-                    input="magnet:?xt=urn:btih:recovered",
-                )
-            ]
+            raise AssertionError("qBittorrent startup records should be classified by the scheduler")
+
+        def active_download_sources(self):
+            raise AssertionError("qBittorrent active records should be classified by the scheduler")
 
         def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
             captured["sources"] = [source.input for source in sources]
@@ -605,19 +602,7 @@ def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_p
     )
 
     assert result.exit_code == 0
-    assert captured["sources"] == ["fresh"]
-    rows = list(csv.DictReader((storage_path / DOWNLOAD_RECORD_FILENAME).open(encoding="utf-8")))
-    assert rows == [
-        {
-            "keyword": "",
-            "origin": "",
-            "input": "magnet:?xt=urn:btih:recovered",
-            "item": "recovered.mp4",
-            "path": str(file_path),
-            "status": "success",
-            "err": "",
-        }
-    ]
+    assert captured["sources"] == ["magnet:?xt=urn:btih:recovered", "fresh"]
 
 
 def test_download_command_routes_qbittorrent_batch_to_seed_priority_scheduler(monkeypatch, tmp_path):

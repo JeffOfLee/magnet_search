@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -168,9 +169,39 @@ class QbittorrentDownloader:
         results: list[DownloadResult] = []
         failures: list[tuple[str, Exception]] = []
         no_seed_counts: dict[str, int] = {}
+        existing_torrents = self._all_torrents()
 
         for index, raw_source in enumerate(sources):
             source = _seed_priority_source(raw_source, index)
+            existing_torrent = self._find_existing_torrent(source, existing_torrents)
+            if existing_torrent is not None:
+                info_hash = str(existing_torrent.get("hash", ""))
+                state = str(existing_torrent.get("state", ""))
+                progress = _float_value(existing_torrent.get("progress"))
+
+                if state == "stalledDL":
+                    failures.append((source.input, DownloadError("qBittorrent torrent state is stalledDL")))
+                    continue
+                if state in ("error", "missingFiles"):
+                    failures.append((source.input, DownloadError(f"qBittorrent torrent error state: {state}")))
+                    continue
+                if progress >= 1.0:
+                    result = self._completed_result_if_cache_complete(source, existing_torrent, output_dir)
+                    if result is not None:
+                        results.append(result)
+                        if on_result is not None:
+                            on_result(result)
+                        continue
+                    if info_hash:
+                        self._remove_torrent(info_hash)
+                elif info_hash:
+                    tracked[info_hash] = source
+                    no_seed_counts[info_hash] = 0
+                    continue
+                else:
+                    failures.append((source.input, DownloadError("qBittorrent existing torrent has no hash")))
+                    continue
+
             try:
                 info_hash = self.add_paused(source.source, output_dir)
             except Exception as error:
@@ -201,6 +232,12 @@ class QbittorrentDownloader:
 
                 state = str(torrent.get("state", ""))
                 progress = _float_value(torrent.get("progress"))
+                if state == "stalledDL":
+                    failures.append((source.input, DownloadError("qBittorrent torrent state is stalledDL")))
+                    del tracked[info_hash]
+                    no_seed_counts.pop(info_hash, None)
+                    continue
+
                 if state in ("error", "missingFiles"):
                     failures.append((source.input, DownloadError(f"qBittorrent torrent error state: {state}")))
                     self._remove_torrent(info_hash)
@@ -209,13 +246,22 @@ class QbittorrentDownloader:
                     continue
 
                 if progress >= 1.0:
-                    result = self._download_result_from_source_torrent(source, torrent, output_dir)
-                    results.append(result)
-                    if on_result is not None:
-                        on_result(result)
-                    self._remove_torrent(info_hash)
                     del tracked[info_hash]
                     no_seed_counts.pop(info_hash, None)
+                    result = self._completed_result_if_cache_complete(source, torrent, output_dir)
+                    if result is not None:
+                        results.append(result)
+                        if on_result is not None:
+                            on_result(result)
+                        continue
+                    self._remove_torrent(info_hash)
+                    try:
+                        new_hash = self.add_paused(source.source, output_dir)
+                    except Exception as error:
+                        failures.append((source.input, error))
+                        continue
+                    tracked[new_hash] = source
+                    no_seed_counts[new_hash] = 0
                     continue
 
                 if self._has_no_active_seeds(torrent):
@@ -250,6 +296,10 @@ class QbittorrentDownloader:
 
         return results, failures
 
+    def _all_torrents(self) -> list[dict]:
+        response = self._api_get("/api/v2/torrents/info")
+        return list(response.json())
+
     def _tracked_torrents(self, hashes: object) -> dict[str, dict]:
         hash_list = list(hashes)
         if not hash_list:
@@ -261,6 +311,33 @@ class QbittorrentDownloader:
             if info_hash:
                 torrents_by_hash[info_hash] = torrent
         return torrents_by_hash
+
+    def _find_existing_torrent(self, source: _SeedPrioritySource, torrents: list[dict]) -> dict | None:
+        identifiers = _source_identifiers(source.source) | _source_identifiers(source.input)
+        for torrent in torrents:
+            if _torrent_matches_identifiers(torrent, identifiers):
+                return torrent
+        return None
+
+    def _completed_result_if_cache_complete(
+        self,
+        source: _SeedPrioritySource,
+        torrent: dict,
+        output_dir: Path,
+    ) -> DownloadResult | None:
+        if not self._torrent_cache_is_complete(torrent, output_dir):
+            return None
+        return self._download_result_from_source_torrent(source, torrent, output_dir)
+
+    def _torrent_cache_is_complete(self, torrent: dict, output_dir: Path) -> bool:
+        files = self._torrent_files(torrent, output_dir)
+        if not files:
+            return False
+        expected_size = _int_value(torrent.get("size"))
+        if expected_size <= 0:
+            return True
+        actual_size = sum(path.stat().st_size for path in files if path.is_file())
+        return actual_size >= expected_size
 
     def _download_result_from_source_torrent(
         self,
@@ -589,6 +666,52 @@ def _float_value(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _source_identifiers(source: str) -> set[str]:
+    identifiers = {source.strip().casefold()}
+    btih = _btih_identifier(source)
+    if btih:
+        identifiers.add(btih)
+
+    source_path = Path(source)
+    if source_path.suffix.lower() == ".torrent" and source_path.exists():
+        info_hash = _torrent_info_hash(source_path.read_bytes())
+        if info_hash:
+            identifiers.add(info_hash.casefold())
+    return {identifier for identifier in identifiers if identifier}
+
+
+def _btih_identifier(source: str) -> str:
+    source = source.strip()
+    parsed = urlparse(source)
+    if parsed.scheme.casefold() == "magnet":
+        for xt in parse_qs(parsed.query).get("xt", []):
+            prefix = "urn:btih:"
+            if xt.casefold().startswith(prefix):
+                return xt[len(prefix) :].casefold()
+
+    if len(source) == 40:
+        try:
+            int(source, 16)
+            return source.casefold()
+        except ValueError:
+            return ""
+    return ""
+
+
+def _torrent_matches_identifiers(torrent: dict, identifiers: set[str]) -> bool:
+    for key in ("hash", "magnet_uri", "name"):
+        value = torrent.get(key)
+        if value and str(value).casefold() in identifiers:
+            return True
+
+    magnet_uri = torrent.get("magnet_uri")
+    if magnet_uri:
+        btih = _btih_identifier(str(magnet_uri))
+        if btih and btih in identifiers:
+            return True
+    return False
 
 
 def _seed_priority_source(source: object, index: int) -> _SeedPrioritySource:
