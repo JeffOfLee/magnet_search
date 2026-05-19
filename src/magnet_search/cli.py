@@ -813,6 +813,8 @@ def download(
     qbittorrent_url: str = typer.Option("http://localhost:8080", help="qBittorrent Web API URL."),
     qbittorrent_username: str = typer.Option("admin", help="qBittorrent Web API username."),
     qbittorrent_password: str = typer.Option("", help="qBittorrent Web API password."),
+    no_seed_checks: int = typer.Option(3, min=1, help="Consecutive no-seed polls before failing a torrent."),
+    poll_interval: float = typer.Option(5.0, min=1.0, help="Seconds between qBittorrent status polls."),
     verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
     metrics_db: Path | None = typer.Option(None, "--metrics-db", help="Runtime metrics SQLite database path."),
 ) -> None:
@@ -848,6 +850,8 @@ def download(
                 url=qbittorrent_url,
                 username=qbittorrent_username,
                 password=qbittorrent_password,
+                poll_interval=poll_interval,
+                no_seed_checks=no_seed_checks,
                 verbose=verbose,
             )
         else:
