@@ -2,16 +2,18 @@ import subprocess
 import threading
 import time
 import csv
-import json
 from pathlib import Path
 
 import pytest
 
 from magnet_search.download import (
     Aria2cDownloader,
+    DOWNLOAD_RECORD_FILENAME,
     DownloadError,
     DownloadResult,
     TransferCacheStorage,
+    append_download_record,
+    load_download_records,
     parse_storage_size,
     run_download_batch,
 )
@@ -219,10 +221,13 @@ def test_run_download_batch_records_results_as_each_item_finishes(tmp_path: Path
         [],
         [
             {
-                "source": "first",
+                "keyword": "",
+                "origin": "",
+                "input": "first",
+                "item": "first.bin",
+                "path": str(output_dir / "first.bin"),
                 "status": "success",
-                "files": json.dumps([str(output_dir / "first.bin")]),
-                "error": "",
+                "err": "",
             }
         ],
     ]
@@ -232,19 +237,126 @@ def test_run_download_batch_records_results_as_each_item_finishes(tmp_path: Path
 
     assert rows == [
         {
-            "source": "first",
+            "keyword": "",
+            "origin": "",
+            "input": "first",
+            "item": "first.bin",
+            "path": str(output_dir / "first.bin"),
             "status": "success",
-            "files": json.dumps([str(output_dir / "first.bin")]),
-            "error": "",
+            "err": "",
         },
         {
-            "source": "second",
+            "keyword": "",
+            "origin": "",
+            "input": "second",
+            "item": "second.bin",
+            "path": str(output_dir / "second.bin"),
             "status": "success",
-            "files": json.dumps([str(output_dir / "second.bin")]),
-            "error": "",
+            "err": "",
         },
-        {"source": "bad", "status": "failed", "files": "[]", "error": "bad failed"},
+        {"keyword": "", "origin": "", "input": "bad", "item": "", "path": "", "status": "failed", "err": "bad failed"},
     ]
+
+
+def test_append_download_record_persists_download_meta_row(tmp_path: Path):
+    output_dir = tmp_path / "downloads"
+    file_path = output_dir / "movie.mp4"
+    file_path.parent.mkdir()
+    file_path.write_text("payload", encoding="utf-8")
+
+    append_download_record(output_dir, DownloadResult(magnet="first", files=[file_path]))
+
+    record_path = output_dir / DOWNLOAD_RECORD_FILENAME
+    with record_path.open(newline="", encoding="utf-8") as record_file:
+        rows = list(csv.DictReader(record_file))
+
+    assert rows == [
+        {
+            "keyword": "",
+            "origin": "",
+            "input": "first",
+            "item": "movie.mp4",
+            "path": str(file_path),
+            "status": "success",
+            "err": "",
+        }
+    ]
+    assert load_download_records(output_dir)[0].input == "first"
+
+
+def test_run_download_batch_propagates_search_meta_columns(tmp_path: Path):
+    input_path = tmp_path / "search.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text(
+        "keyword,origin,result,status,err\n"
+        "Sample Movie,archive,magnet:?xt=urn:btih:first,success,\n",
+        encoding="utf-8",
+    )
+    downloader = Aria2cDownloader(runner=FakeRunner(output_dir))
+
+    run_download_batch(input_path, column="result", output_dir=output_dir, downloader=downloader)
+
+    records = load_download_records(output_dir)
+    assert records[0].keyword == "Sample Movie"
+    assert records[0].origin == "archive"
+    assert records[0].input == "magnet:?xt=urn:btih:first"
+
+
+def test_run_download_batch_writes_download_cache_record(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text("magnet\nfirst\n", encoding="utf-8")
+    downloader = Aria2cDownloader(runner=FakeRunner(output_dir))
+
+    run_download_batch(input_path, column="magnet", output_dir=output_dir, downloader=downloader)
+
+    records = load_download_records(output_dir)
+    assert len(records) == 1
+    assert records[0].input == "first"
+    assert records[0].path.name == "download-1.bin"
+
+
+def test_run_download_batch_skips_successful_records_and_cleans_failed_residue(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir()
+    result_path = output_dir / DOWNLOAD_RECORD_FILENAME
+    stale_file = output_dir / "partial.bin"
+    stale_file.write_text("partial", encoding="utf-8")
+    input_path.write_text("magnet\nfirst\nbad\nsecond\n", encoding="utf-8")
+    result_path.write_text(
+        "keyword,origin,input,item,path,status,err\n"
+        f",,first,first.bin,{output_dir / 'first.bin'},success,\n"
+        f",,bad,partial.bin,{stale_file},failed,previous failure\n",
+        encoding="utf-8",
+    )
+    downloader = TrackingDownloader()
+
+    results, _ = run_download_batch(input_path, column="magnet", output_dir=output_dir, downloader=downloader)
+
+    assert downloader.calls == ["bad", "second"]
+    assert [result.magnet for result in results] == ["bad", "second"]
+    assert not stale_file.exists()
+    rows = list(csv.DictReader(result_path.open(encoding="utf-8")))
+    assert [row["input"] for row in rows] == ["first", "bad", "bad", "second"]
+
+
+def test_run_download_batch_skips_sources_already_handled_from_cache(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_dir = tmp_path / "downloads"
+    input_path.write_text("magnet\nfirst\nsecond\n", encoding="utf-8")
+    downloader = TrackingDownloader()
+
+    results, _ = run_download_batch(
+        input_path,
+        column="magnet",
+        output_dir=output_dir,
+        downloader=downloader,
+        skip_sources={"first"},
+    )
+
+    assert downloader.calls == ["second"]
+    assert [result.magnet for result in results] == ["second"]
 
 
 @pytest.mark.parametrize(

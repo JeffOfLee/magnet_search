@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,8 +55,11 @@ def load_s3_upload_config(path: Path) -> S3UploadConfig:
 
 
 class S3Uploader:
-    def __init__(self, config: S3UploadConfig, client: Any | None = None):
+    def __init__(self, config: S3UploadConfig, client: Any | None = None, key_gen: str = "hash"):
+        if key_gen not in ("hash", "path"):
+            raise UploadConfigError("key_gen must be hash or path")
         self.config = config
+        self.key_gen = key_gen
         self.client = client or self._build_client(config)
 
     def upload_files(self, files: list[Path], base_dir: Path) -> list[str]:
@@ -97,7 +101,11 @@ class S3Uploader:
         except ValueError:
             relative = file_path.name
 
+        key = relative
+        if self.key_gen == "hash":
+            key = f"{hashlib.sha256(relative.encode('utf-8')).hexdigest()}{file_path.suffix}"
+
         prefix = self.config.prefix.strip("/")
         if not prefix:
-            return relative
-        return f"{prefix}/{relative}"
+            return key
+        return f"{prefix}/{key}"

@@ -45,12 +45,14 @@ class QbittorrentDownloader:
         password: str = "",
         poll_interval: float = 5.0,
         http_timeout: float = 30.0,
+        no_seed_checks: int = 3,
     ):
         self.url = url.rstrip("/")
         self.username = username
         self.password = password
         self.poll_interval = poll_interval
         self.http_timeout = http_timeout
+        self.no_seed_checks = no_seed_checks
         self._session: httpx.Client | None = None
 
     def _client(self) -> httpx.Client:
@@ -159,17 +161,36 @@ class QbittorrentDownloader:
 
         after = _snapshot_files(output_dir)
 
+        self._remove_torrent(info_hash)
+
+        return DownloadResult(magnet=source, files=_changed_files(before, after))
+
+    def _remove_torrent(self, info_hash: str) -> None:
         try:
             self._api_post("/api/v2/torrents/delete", data={"hashes": info_hash, "deleteFiles": "false"})
         except Exception:
             pass
 
-        return DownloadResult(magnet=source, files=_changed_files(before, after))
-
     def _get_hashes(self) -> set[str]:
         try:
             response = self._api_get("/api/v2/torrents/info")
             return {t["hash"] for t in response.json()}
+        except Exception:
+            return set()
+
+    def active_download_sources(self) -> set[str]:
+        active_states = frozenset(("downloading", "stalledDL", "forcedDL", "queuedDL", "metaDL", "checkingDL"))
+        try:
+            response = self._api_get("/api/v2/torrents/info")
+            active: set[str] = set()
+            for torrent in response.json():
+                if torrent.get("state") not in active_states:
+                    continue
+                for key in ("magnet_uri", "hash", "name"):
+                    value = torrent.get(key)
+                    if value:
+                        active.add(str(value))
+            return active
         except Exception:
             return set()
 
@@ -188,6 +209,7 @@ class QbittorrentDownloader:
 
     def _wait_for_completion(self, info_hash: str) -> None:
         completed_states = frozenset(("pausedUP", "uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP"))
+        no_seed_count = 0
         while True:
             try:
                 response = self._api_get("/api/v2/torrents/info", params={"hashes": info_hash})
@@ -203,8 +225,24 @@ class QbittorrentDownloader:
                     raise DownloadError(f"qBittorrent torrent error state: {state}")
                 if state in completed_states and progress >= 1.0:
                     return
+                if self._has_no_active_seeds(torrent):
+                    no_seed_count += 1
+                    if no_seed_count >= self.no_seed_checks:
+                        self._remove_torrent(info_hash)
+                        raise DownloadError("qBittorrent torrent has no active seeds")
+                else:
+                    no_seed_count = 0
             except DownloadError:
                 raise
             except Exception:
                 pass
             time.sleep(self.poll_interval)
+
+    def _has_no_active_seeds(self, torrent: dict) -> bool:
+        seeds = torrent.get("num_seeds")
+        if seeds is None:
+            return False
+        try:
+            return int(seeds) <= 0 and torrent.get("progress", 0) < 1.0
+        except (TypeError, ValueError):
+            return False

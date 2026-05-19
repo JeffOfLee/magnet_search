@@ -8,14 +8,14 @@
 magnet-search search "resource name" --limit 3
 magnet-search search "resource name" --limit 3 --json
 magnet-search search "resource name" --limit 3 --verbose
-magnet-search search input.csv --output results.csv --limit 3
-magnet-search search input.csv --column title --output results.csv --limit 3
+magnet-search search input.csv --search-meta .search_record.csv --limit 3
+magnet-search search input.csv --column title --search-meta .search_record.csv --limit 3
 magnet-search download "magnet:?xt=..." --storage downloads/
 magnet-search download movie.torrent --storage downloads/
-magnet-search download input.csv --storage downloads/ --output download-results.csv
-magnet-search download input.csv --column magnet --storage downloads/ --output download-results.csv --upload s3-upload.toml
-magnet-search download input.csv --storage downloads/ --output download-results.csv --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
-magnet-search download input.csv --storage downloads/ --output download-results.csv --upload s3-upload.toml --transfer-cache-storage 10GB
+magnet-search download .search_record.csv --storage downloads/ --download-meta downloads/.download_meta.csv
+magnet-search download downloads/.download_meta.csv --storage downloads/ --upload s3-upload.toml --upload-meta downloads/.upload_meta.csv --key-gen hash
+magnet-search download input.csv --storage downloads/ --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
+magnet-search download input.csv --storage downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
 The built-in provider targets public/legal metadata. The tool does not include built-in piracy or gray-market sources. Additional providers can be configured by the user in TOML.
@@ -26,12 +26,12 @@ The `search` command accepts either a single query or a CSV path:
 
 ```bash
 magnet-search search "resource name" --limit 3
-magnet-search search input.csv --output results.csv
-magnet-search search input.csv --column title --output results.csv
-magnet-search search input.csv --output results.csv --verbose
+magnet-search search input.csv
+magnet-search search input.csv --column title --search-meta search-meta.csv
+magnet-search search input.csv --search-meta search-meta.csv --verbose
 ```
 
-If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `query`; use `--column` to override it. Batch search requires `--output`.
+If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `query`; use `--column` to override it. Batch search writes `--search-meta`, defaulting to `.search_record.csv`. The legacy `--output` alias still works for this path.
 
 The legacy `batch` command is still available for existing scripts:
 
@@ -74,9 +74,9 @@ Install aria2 before running downloads. The `download` command accepts a single 
 ```bash
 magnet-search download "magnet:?xt=..." --storage downloads/
 magnet-search download movie.torrent --storage downloads/
-magnet-search download input.csv --storage downloads/ --output download-results.csv
-magnet-search download input.csv --column link --storage downloads/ --output download-results.csv
-magnet-search download input.csv --storage downloads/ --output download-results.csv --verbose
+magnet-search download input.csv --storage downloads/
+magnet-search download input.csv --column link --storage downloads/ --download-meta downloads/.download_meta.csv
+magnet-search download .search_record.csv --storage downloads/ --verbose
 ```
 
 ### qBittorrent
@@ -91,21 +91,35 @@ magnet-search download "magnet:?xt=..." --storage downloads/ --engine qbittorren
   --qbittorrent-password adminadmin
 ```
 
-If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
+If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; when the input is a search metadata file, the command automatically uses `result`. Use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
 
-For `download`, `--storage` is the local download/cache directory. In CSV batch mode, `--output` writes a real-time CSV result log with `source`, `status`, `files`, and `error` columns.
+For `download`, `--storage` is the local download/cache directory. `--download-meta` writes a real-time CSV result log and defaults to `{storage}/.download_meta.csv`. The legacy `--output` alias still maps to `--download-meta`.
 
 To upload downloaded files to S3 after the local download completes, pass an upload config file:
 
 ```bash
-magnet-search download input.csv --storage downloads/ --output download-results.csv --upload s3-upload.toml
-magnet-search download input.csv --storage downloads/ --output download-results.csv --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
-magnet-search download input.csv --storage downloads/ --output download-results.csv --upload s3-upload.toml --transfer-cache-storage 10GB
+magnet-search download input.csv --storage downloads/ --upload s3-upload.toml
+magnet-search download input.csv --storage downloads/ --download-concurrency 4 --upload s3-upload.toml --upload-concurrency 8
+magnet-search download downloads/.download_meta.csv --storage downloads/ --upload s3-upload.toml --upload-meta uploads.csv --key-gen path
+magnet-search download input.csv --storage downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
 `--download-concurrency` controls how many CSV batch rows can download at the same time. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Both default to `1`.
 
+When `--upload` is provided, upload progress is written to `--upload-meta`, defaulting to `{storage}/.upload_meta.csv`. If the input CSV is a download metadata file, the command uploads the already-downloaded files from that metadata instead of downloading again.
+
+`--key-gen` controls S3 object key generation and defaults to `hash`:
+
+- `hash`: `{prefix}/sha256(relative-storage-path).{ext}`. This avoids unsupported or awkward filename characters in object keys while preserving the original extension.
+- `path`: `{prefix}/relative-storage-path`. This keeps the resource path under `--storage`.
+
 `--transfer-cache-storage` limits the current-run local transfer cache before starting new batch downloads. It accepts sizes such as `500MB`, `10GB`, and `1.5GiB`, and requires `--upload`. When the tracked downloaded files exceed the limit, new downloads wait until a completed upload deletes its local files and releases cache space. Downloads already in progress are allowed to finish, so cache usage can temporarily exceed the limit.
+
+The search, download, and upload stages can be restarted after interruption:
+
+- Search reads the existing search metadata and skips keywords that already have `status=success`.
+- Download reads the existing download metadata, skips inputs that already have `status=success`, removes failed-record residue under `--storage`, and for qBittorrent also skips active `downloading`/`stalledDL` tasks reported by the Web API.
+- Upload reads the upload metadata and cache directory, deletes cache files already marked successful, and enqueues successful download records that still exist locally but do not yet have successful upload rows.
 
 Add `--verbose` to print detailed process logs to stderr. Normal stdout remains unchanged, so JSON output and CSV file outputs stay parseable.
 
@@ -128,10 +142,22 @@ Use the configurable `JsonHttpProvider` path when an upstream source already ret
 
 The full contributor guide is in [docs/custom-provider-development.md](/Users/fujiao.li/source/magnet_search/docs/custom-provider-development.md).
 
-## Output Columns
+## Metadata Columns
 
-Batch output writes:
+Search metadata (`--search-meta`, default `.search_record.csv`) writes:
 
 ```text
-query,title,magnet,source,size,published_at,score,url
+keyword,origin,result,status,err
+```
+
+Download metadata (`--download-meta`, default `{storage}/.download_meta.csv`) writes:
+
+```text
+keyword,origin,input,item,path,status,err
+```
+
+Upload metadata (`--upload-meta`, default `{storage}/.upload_meta.csv`) writes:
+
+```text
+keyword,origin,input,item,path,s3_key,status,err
 ```

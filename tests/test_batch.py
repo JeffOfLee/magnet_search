@@ -28,9 +28,37 @@ def test_run_batch_writes_one_row_per_result(tmp_path: Path):
     run_batch(input_path, column="title", output_path=output_path, limit=3, search_func=fake_search)
 
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["query"] == "Sample Movie"
-    assert rows[0]["title"] == "Sample Movie Result"
-    assert rows[0]["magnet"] == "magnet:?xt=urn:btih:sample"
+    assert rows == [
+        {
+            "keyword": "Sample Movie",
+            "origin": "test",
+            "result": "magnet:?xt=urn:btih:sample",
+            "status": "success",
+            "err": "",
+        }
+    ]
+
+
+def test_run_batch_skips_keywords_already_successful_in_existing_search_meta(tmp_path: Path):
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / ".search_record.csv"
+    input_path.write_text("title\nDone Movie\nNew Movie\n", encoding="utf-8")
+    output_path.write_text(
+        "keyword,origin,result,status,err\n"
+        "Done Movie,archive,magnet:?xt=urn:btih:done,success,\n",
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def fake_search(query: str, limit: int):
+        calls.append(query)
+        return [make_result(query=query)]
+
+    run_batch(input_path, column="title", output_path=output_path, limit=3, search_func=fake_search)
+
+    rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
+    assert calls == ["New Movie"]
+    assert [row["keyword"] for row in rows] == ["Done Movie", "New Movie"]
 
 
 def test_run_batch_writes_empty_result_row_when_no_results(tmp_path: Path):
@@ -43,14 +71,11 @@ def test_run_batch_writes_empty_result_row_when_no_results(tmp_path: Path):
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
     assert rows == [
         {
-            "query": "Missing Movie",
-            "title": "",
-            "magnet": "",
-            "source": "",
-            "size": "",
-            "published_at": "",
-            "score": "",
-            "url": "",
+            "keyword": "Missing Movie",
+            "origin": "",
+            "result": "",
+            "status": "failed",
+            "err": "no results",
         }
     ]
 
@@ -82,7 +107,7 @@ def test_run_batch_preserves_original_query_when_result_query_differs(tmp_path: 
     )
 
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["query"] == "Original Movie"
+    assert rows[0]["keyword"] == "Original Movie"
 
 
 def test_run_batch_handles_utf8_bom_header(tmp_path: Path):
@@ -93,7 +118,7 @@ def test_run_batch_handles_utf8_bom_header(tmp_path: Path):
     run_batch(input_path, column="title", output_path=output_path, limit=3, search_func=lambda query, limit: [])
 
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["query"] == "Sample Movie"
+    assert rows[0]["keyword"] == "Sample Movie"
 
 
 def test_run_batch_rejects_duplicate_headers(tmp_path: Path):
@@ -116,8 +141,9 @@ def test_run_batch_treats_whitespace_query_as_empty_without_searching(tmp_path: 
     run_batch(input_path, column="title", output_path=output_path, limit=3, search_func=fail_search)
 
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["query"] == "   "
-    assert rows[0]["title"] == ""
+    assert rows[0]["keyword"] == "   "
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["err"] == "empty keyword"
 
 
 def test_run_batch_serializes_zero_score(tmp_path: Path):
@@ -134,7 +160,7 @@ def test_run_batch_serializes_zero_score(tmp_path: Path):
     )
 
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["score"] == "0.0"
+    assert rows[0]["status"] == "success"
 
 
 def test_run_batch_creates_output_parent_directory(tmp_path: Path):
@@ -196,17 +222,23 @@ def test_run_batch_rejects_non_search_result_items_atomically(tmp_path: Path):
     assert output_path.read_text(encoding="utf-8") == original_output
 
 
-def test_run_batch_leaves_existing_output_unchanged_when_search_raises(tmp_path: Path):
+def test_run_batch_records_failed_status_when_search_raises(tmp_path: Path):
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
-    original_output = "existing output\n"
     input_path.write_text("title\nSample Movie\n", encoding="utf-8")
-    output_path.write_text(original_output, encoding="utf-8")
 
     def fail_search(query: str, limit: int):
         raise RuntimeError("search failed")
 
-    with pytest.raises(RuntimeError, match="search failed"):
-        run_batch(input_path, column="title", output_path=output_path, limit=3, search_func=fail_search)
+    run_batch(input_path, column="title", output_path=output_path, limit=3, search_func=fail_search)
 
-    assert output_path.read_text(encoding="utf-8") == original_output
+    rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
+    assert rows == [
+        {
+            "keyword": "Sample Movie",
+            "origin": "",
+            "result": "",
+            "status": "failed",
+            "err": "search failed",
+        }
+    ]

@@ -261,3 +261,37 @@ def test_qbittorrent_reports_missing_files_state(tmp_path: Path):
 
     with pytest.raises(DownloadError, match="torrent error state"):
         downloader.download("magnet:?xt=urn:btih:sample", output_dir)
+
+
+def test_qbittorrent_removes_torrent_when_no_active_seeds(tmp_path: Path):
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir()
+
+    mock_client = MagicMock()
+    mock_client.post.return_value = FakeResponse("Ok.")
+
+    get_calls = [0]
+
+    def mock_get(endpoint, params=None):
+        get_calls[0] += 1
+        if params and params.get("hashes"):
+            torrent = _make_torrent(params["hashes"], "downloading", 0.25)
+            torrent["num_seeds"] = 0
+            return FakeResponse(json_data=[torrent])
+        if get_calls[0] == 1:
+            return FakeResponse(json_data=[])
+        return FakeResponse(json_data=[_make_torrent("newhash")])
+
+    mock_client.get.side_effect = mock_get
+
+    downloader = QbittorrentDownloader(poll_interval=0.01, no_seed_checks=2)
+    downloader._session = mock_client
+
+    with pytest.raises(DownloadError, match="no active seeds"):
+        downloader.download("magnet:?xt=urn:btih:sample", output_dir)
+
+    delete_calls = [
+        call for call in mock_client.post.call_args_list if "/torrents/delete" in call[0][0]
+    ]
+    assert delete_calls
+    assert delete_calls[-1][1]["data"] == {"hashes": "newhash", "deleteFiles": "false"}

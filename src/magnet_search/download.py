@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import re
 import subprocess
 import threading
@@ -23,13 +22,46 @@ class DownloadError(RuntimeError):
 class DownloadResult:
     magnet: str
     files: list[Path]
+    keyword: str = ""
+    origin: str = ""
+    input: str = ""
+
+
+@dataclass(frozen=True)
+class DownloadRecord:
+    keyword: str
+    origin: str
+    input: str
+    item: str
+    path: Path
+    status: str
+    err: str = ""
+
+    @property
+    def source(self) -> str:
+        return self.input
+
+    @property
+    def file(self) -> Path:
+        return self.path
+
+
+@dataclass(frozen=True)
+class DownloadSource:
+    keyword: str
+    origin: str
+    input: str
+    source: str
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 ResultCallback = Callable[[DownloadResult], None]
 BeforeDownloadCallback = Callable[[], None]
-RESULT_FIELDS = ["source", "status", "files", "error"]
-UPLOAD_RESULT_FIELDS = ["source", "status", "file", "s3_key", "error"]
+RESULT_FIELDS = ["keyword", "origin", "input", "item", "path", "status", "err"]
+UPLOAD_RESULT_FIELDS = ["keyword", "origin", "input", "item", "path", "s3_key", "status", "err"]
+DOWNLOAD_RECORD_FILENAME = ".download_meta.csv"
+DOWNLOAD_RECORD_FIELDS = RESULT_FIELDS
+_download_record_lock = threading.Lock()
 
 
 def write_upload_results_csv(
@@ -49,30 +81,177 @@ def write_upload_results_csv(
                 for i, file_path in enumerate(result.files):
                     s3_key = s3_keys[i] if i < len(s3_keys) else ""
                     writer.writerow({
-                        "source": result.magnet,
-                        "status": "uploaded",
-                        "file": str(file_path),
+                        "keyword": result.keyword,
+                        "origin": result.origin,
+                        "input": _result_input(result),
+                        "item": _item_for_path(file_path, base_dir=result_path.parent),
+                        "path": str(file_path),
                         "s3_key": s3_key,
-                        "error": "",
+                        "status": "success",
+                        "err": "",
                     })
             else:
                 writer.writerow({
-                    "source": result.magnet,
-                    "status": "uploaded",
-                    "file": "",
+                    "keyword": result.keyword,
+                    "origin": result.origin,
+                    "input": _result_input(result),
+                    "item": "",
+                    "path": "",
                     "s3_key": "",
-                    "error": "",
+                    "status": "success",
+                    "err": "",
                 })
 
         for source, error in failures:
             writer.writerow({
-                "source": source,
-                "status": "failed",
-                "file": "",
+                "keyword": "",
+                "origin": "",
+                "input": source,
+                "item": "",
+                "path": "",
                 "s3_key": "",
-                "error": str(error),
+                "status": "failed",
+                "err": str(error),
             })
         f.flush()
+
+
+def _download_meta_path(target: Path) -> Path:
+    if target.suffix.lower() == ".csv":
+        return target
+    return target / DOWNLOAD_RECORD_FILENAME
+
+
+def _cleanup_record_paths(records: list[DownloadRecord], base_dir: Path, status: str) -> None:
+    for record in records:
+        if record.status != status or not str(record.path):
+            continue
+        cleanup_download_result(DownloadResult(record.input, [record.path]), base_dir)
+
+
+def _successful_record_inputs(records: list[DownloadRecord]) -> set[str]:
+    return {
+        record.input
+        for record in records
+        if record.status == "success" and record.input
+    }
+
+
+def _source_is_skipped(source: str, skipped: set[str]) -> bool:
+    if source in skipped:
+        return True
+    folded = source.casefold()
+    return any(token and token.casefold() in folded for token in skipped)
+
+
+def _result_input(result: DownloadResult) -> str:
+    return result.input or result.magnet
+
+
+def _item_for_path(file_path: Path, base_dir: Path) -> str:
+    try:
+        return str(file_path.relative_to(base_dir))
+    except ValueError:
+        return file_path.name
+
+
+def _download_rows(
+    base_dir: Path,
+    result: DownloadResult | None = None,
+    failure: tuple[str, Exception] | None = None,
+    failure_keyword: str = "",
+    failure_origin: str = "",
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+
+    if result is not None:
+        rows.extend(
+            {
+                "keyword": result.keyword,
+                "origin": result.origin,
+                "input": _result_input(result),
+                "item": _item_for_path(file_path, base_dir),
+                "path": str(file_path),
+                "status": "success",
+                "err": "",
+            }
+            for file_path in result.files
+        )
+        if not result.files:
+            rows.append(
+                {
+                    "keyword": result.keyword,
+                    "origin": result.origin,
+                    "input": _result_input(result),
+                    "item": "",
+                    "path": "",
+                    "status": "success",
+                    "err": "",
+                }
+            )
+
+    if failure is not None:
+        source, error = failure
+        rows.append(
+            {
+                "keyword": failure_keyword,
+                "origin": failure_origin,
+                "input": source,
+                "item": "",
+                "path": "",
+                "status": "failed",
+                "err": str(error),
+            }
+        )
+    return rows
+
+
+def append_download_record(
+    output_dir: Path,
+    result: DownloadResult | None = None,
+    failure: tuple[str, Exception] | None = None,
+    failure_keyword: str = "",
+    failure_origin: str = "",
+) -> None:
+    record_path = _download_meta_path(output_dir)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = output_dir if output_dir.suffix.lower() != ".csv" else record_path.parent
+    rows = _download_rows(base_dir, result, failure, failure_keyword, failure_origin)
+
+    if not rows:
+        return
+
+    with _download_record_lock:
+        write_header = not record_path.exists() or record_path.stat().st_size == 0
+        with record_path.open("a", newline="", encoding="utf-8") as record_file:
+            writer = csv.DictWriter(record_file, fieldnames=DOWNLOAD_RECORD_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+            record_file.flush()
+
+
+def load_download_records(output_dir: Path) -> list[DownloadRecord]:
+    record_path = _download_meta_path(output_dir)
+    if not record_path.exists():
+        return []
+
+    records: list[DownloadRecord] = []
+    with record_path.open(newline="", encoding="utf-8") as record_file:
+        reader = csv.DictReader(record_file)
+        for row in reader:
+            records.append(
+                DownloadRecord(
+                    keyword=row.get("keyword", ""),
+                    origin=row.get("origin", ""),
+                    input=row.get("input", row.get("source", "")),
+                    item=row.get("item", ""),
+                    path=Path(row.get("path", row.get("file", ""))),
+                    status=row.get("status", ""),
+                    err=row.get("err", row.get("error", "")),
+                )
+            )
+    return records
 
 
 _STORAGE_SIZE_PATTERN = re.compile(r"^\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]*)\s*$")
@@ -208,6 +387,31 @@ def _resolve_download_source(source: str, base_dir: Path | None = None) -> str:
     return source
 
 
+def _source_from_row(row: dict[str, str], column: str, base_dir: Path) -> DownloadSource | None:
+    raw_input = row.get(column, "").strip()
+    if not raw_input:
+        return None
+    resolved = _resolve_download_source(raw_input, base_dir)
+    return DownloadSource(
+        keyword=row.get("keyword", ""),
+        origin=row.get("origin", ""),
+        input=resolved,
+        source=resolved,
+    )
+
+
+def _select_download_column(fieldnames: list[str] | None, column: str) -> str:
+    if fieldnames is None:
+        raise DownloadError(f"missing column: {column}")
+    if column in fieldnames:
+        return column
+    if column == "magnet":
+        for candidate in ("result", "input"):
+            if candidate in fieldnames:
+                return candidate
+    raise DownloadError(f"missing column: {column}")
+
+
 class Aria2cDownloader:
     def __init__(self, runner: Runner | None = None, verbose: bool = False):
         self.runner = runner or subprocess.run
@@ -261,12 +465,15 @@ def _failure_message(failures: list[tuple[str, Exception]]) -> str:
 
 
 class _ResultRecorder:
-    def __init__(self, result_path: Path):
+    def __init__(self, result_path: Path, base_dir: Path):
         self.result_path = result_path
+        self.base_dir = base_dir
         self.result_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.result_path.open("w", newline="", encoding="utf-8")
+        write_header = not self.result_path.exists() or self.result_path.stat().st_size == 0
+        self._file = self.result_path.open("a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=RESULT_FIELDS)
-        self._writer.writeheader()
+        if write_header:
+            self._writer.writeheader()
         self._file.flush()
 
     def __enter__(self) -> _ResultRecorder:
@@ -276,24 +483,17 @@ class _ResultRecorder:
         self._file.close()
 
     def record_success(self, result: DownloadResult) -> None:
-        self._write(
-            {
-                "source": result.magnet,
-                "status": "success",
-                "files": json.dumps([str(path) for path in result.files]),
-                "error": "",
-            }
-        )
+        for row in _download_rows(self.base_dir, result=result):
+            self._write(row)
 
-    def record_failure(self, source: str, error: Exception) -> None:
-        self._write(
-            {
-                "source": source,
-                "status": "failed",
-                "files": "[]",
-                "error": str(error),
-            }
-        )
+    def record_failure(self, source: DownloadSource, error: Exception) -> None:
+        for row in _download_rows(
+            self.base_dir,
+            failure=(source.input, error),
+            failure_keyword=source.keyword,
+            failure_origin=source.origin,
+        ):
+            self._write(row)
 
     def _write(self, row: dict[str, str]) -> None:
         self._writer.writerow(row)
@@ -310,24 +510,33 @@ def run_download_batch(
     before_download: BeforeDownloadCallback | None = None,
     result_path: Path | None = None,
     raise_on_failure: bool = True,
+    skip_sources: set[str] | None = None,
 ) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
     if download_concurrency < 1:
         raise DownloadError("download_concurrency must be at least 1")
 
     with input_path.open(newline="", encoding="utf-8-sig") as input_file:
         reader = csv.DictReader(input_file)
-        _validate_headers(reader.fieldnames, column)
+        selected_column = _select_download_column(reader.fieldnames, column)
+        _validate_headers(reader.fieldnames, selected_column)
 
-        sources = [
-            _resolve_download_source(source, input_path.parent)
-            for row in reader
-            if (source := row.get(column, "")).strip()
-        ]
+        skipped = skip_sources or set()
+        download_meta_path = result_path or output_dir / DOWNLOAD_RECORD_FILENAME
+        existing_records = load_download_records(download_meta_path)
+        _cleanup_record_paths(existing_records, output_dir, "failed")
+        skipped = skipped | _successful_record_inputs(existing_records)
+        sources: list[DownloadSource] = []
+        for row in reader:
+            if row.get("status") == "failed":
+                continue
+            source = _source_from_row(row, selected_column, input_path.parent)
+            if source is not None and not _source_is_skipped(source.input, skipped):
+                sources.append(source)
 
         results: list[DownloadResult] = []
         failures: list[tuple[str, Exception]] = []
 
-        recorder_context = _ResultRecorder(result_path) if result_path is not None else None
+        recorder_context = _ResultRecorder(download_meta_path, output_dir)
         if recorder_context is None:
             results, failures = _run_downloads(
                 sources,
@@ -359,7 +568,7 @@ def run_download_batch(
 
 
 def _run_downloads(
-    sources: list[str],
+    sources: list[DownloadSource],
     output_dir: Path,
     downloader: Any,
     download_concurrency: int,
@@ -374,9 +583,16 @@ def _run_downloads(
             try:
                 if before_download is not None:
                     before_download()
-                result = downloader.download(source, output_dir)
+                result = downloader.download(source.source, output_dir)
+                result = DownloadResult(
+                    magnet=result.magnet,
+                    files=result.files,
+                    keyword=source.keyword,
+                    origin=source.origin,
+                    input=source.input,
+                )
             except Exception as error:
-                failures.append((source, error))
+                failures.append((source.input, error))
                 if recorder is not None:
                     recorder.record_failure(source, error)
                 continue
@@ -387,10 +603,17 @@ def _run_downloads(
                 on_result(result)
     else:
 
-        def download_source(source: str) -> DownloadResult:
+        def download_source(source: DownloadSource) -> DownloadResult:
             if before_download is not None:
                 before_download()
-            return downloader.download(source, output_dir)
+            result = downloader.download(source.source, output_dir)
+            return DownloadResult(
+                magnet=result.magnet,
+                files=result.files,
+                keyword=source.keyword,
+                origin=source.origin,
+                input=source.input,
+            )
 
         with ThreadPoolExecutor(max_workers=download_concurrency) as executor:
             futures = {executor.submit(download_source, source): (index, source) for index, source in enumerate(sources)}
@@ -400,7 +623,7 @@ def _run_downloads(
                 try:
                     result = future.result()
                 except Exception as error:
-                    failures.append((source, error))
+                    failures.append((source.input, error))
                     if recorder is not None:
                         recorder.record_failure(source, error)
                     continue

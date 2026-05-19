@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import csv
-import tempfile
 from pathlib import Path
 from typing import Callable
 
 from magnet_search.models import SearchResult
 
 
-OUTPUT_FIELDS = ["query", "title", "magnet", "source", "size", "published_at", "score", "url"]
+OUTPUT_FIELDS = ["keyword", "origin", "result", "status", "err"]
 
 
 class BatchError(ValueError):
@@ -17,19 +16,22 @@ class BatchError(ValueError):
 
 def _row_from_result(query: str, result: SearchResult) -> dict[str, str]:
     return {
-        "query": query,
-        "title": result.title,
-        "magnet": result.magnet,
-        "source": result.source,
-        "size": result.size,
-        "published_at": result.published_at,
-        "score": str(result.score),
-        "url": result.url,
+        "keyword": query,
+        "origin": result.source,
+        "result": result.magnet,
+        "status": "success",
+        "err": "",
     }
 
 
-def _empty_row(query: str) -> dict[str, str]:
-    return {field: "" for field in OUTPUT_FIELDS} | {"query": query}
+def _failed_row(query: str, error: str) -> dict[str, str]:
+    return {
+        "keyword": query,
+        "origin": "",
+        "result": "",
+        "status": "failed",
+        "err": error,
+    }
 
 
 def _validate_headers(fieldnames: list[str] | None, column: str) -> None:
@@ -66,25 +68,27 @@ def run_batch(
         _validate_headers(reader.fieldnames, column)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path: Path | None = None
+        successful_keywords = _successful_keywords(output_path)
+        write_header = not output_path.exists() or output_path.stat().st_size == 0
         try:
-            temp_file = tempfile.NamedTemporaryFile(
-                "w",
-                newline="",
-                encoding="utf-8",
-                dir=output_path.parent,
-                prefix=f".{output_path.name}.",
-                suffix=".tmp",
-                delete=False,
-            )
-            temp_path = Path(temp_file.name)
-            with temp_file as output_file:
-                _write_output(reader, column, output_file, limit, search_func)
-            temp_path.replace(output_path)
-        except Exception:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
+            with output_path.open("a", newline="", encoding="utf-8") as output_file:
+                _write_output(reader, column, output_file, limit, search_func, successful_keywords, write_header)
+        except BatchError:
+            if write_header:
+                output_path.unlink(missing_ok=True)
             raise
+
+
+def _successful_keywords(output_path: Path) -> set[str]:
+    if not output_path.exists():
+        return set()
+    with output_path.open(newline="", encoding="utf-8") as output_file:
+        reader = csv.DictReader(output_file)
+        return {
+            row.get("keyword", "")
+            for row in reader
+            if row.get("status") == "success" and row.get("keyword", "")
+        }
 
 
 def _write_output(
@@ -93,14 +97,29 @@ def _write_output(
     output_file,
     limit: int,
     search_func: Callable[[str, int], list[SearchResult]],
+    successful_keywords: set[str] | None = None,
+    write_header: bool = True,
 ) -> None:
     writer = csv.DictWriter(output_file, fieldnames=OUTPUT_FIELDS)
-    writer.writeheader()
+    if write_header:
+        writer.writeheader()
+    successful_keywords = successful_keywords or set()
     for row in reader:
         query = row.get(column, "")
-        results = _validate_results(search_func(query, limit)) if query.strip() else []
+        if query in successful_keywords:
+            continue
+        if not query.strip():
+            writer.writerow(_failed_row(query, "empty keyword"))
+            continue
+        try:
+            raw_results = search_func(query, limit)
+        except Exception as error:
+            writer.writerow(_failed_row(query, str(error)))
+            continue
+
+        results = _validate_results(raw_results)
         if not results:
-            writer.writerow(_empty_row(query))
+            writer.writerow(_failed_row(query, "no results"))
             continue
         for result in results:
             writer.writerow(_row_from_result(query, result))

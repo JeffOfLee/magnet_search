@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from magnet_search import cli
 from magnet_search.config import ConfigError
-from magnet_search.download import DownloadError
+from magnet_search.download import DOWNLOAD_RECORD_FILENAME, DownloadError
 from magnet_search.storage import UploadConfigError
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
 
@@ -151,15 +151,22 @@ def test_search_command_all_providers_failed_exits_1(monkeypatch):
 def test_search_command_writes_batch_csv_with_default_query_column(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
     input_path = tmp_path / "input.csv"
-    output_path = tmp_path / "output.csv"
+    output_path = tmp_path / "search-meta.csv"
     input_path.write_text("query\nsample movie\n", encoding="utf-8")
 
-    result = runner.invoke(cli.app, ["search", str(input_path), "--output", str(output_path)])
+    result = runner.invoke(cli.app, ["search", str(input_path), "--search_meta", str(output_path)])
 
     assert result.exit_code == 0
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["query"] == "sample movie"
-    assert rows[0]["title"] == "Sample Result"
+    assert rows == [
+        {
+            "keyword": "sample movie",
+            "origin": "test",
+            "result": "magnet:?xt=urn:btih:sample",
+            "status": "success",
+            "err": "",
+        }
+    ]
     assert "wrote" in result.stdout
 
 
@@ -171,13 +178,13 @@ def test_search_command_writes_batch_csv_with_custom_column(monkeypatch, tmp_pat
 
     result = runner.invoke(
         cli.app,
-        ["search", str(input_path), "--column", "title", "--output", str(output_path)],
+        ["search", str(input_path), "--column", "title", "--search-meta", str(output_path)],
     )
 
     assert result.exit_code == 0
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["query"] == "sample movie"
-    assert rows[0]["title"] == "Sample Result"
+    assert rows[0]["keyword"] == "sample movie"
+    assert rows[0]["origin"] == "test"
 
 
 def test_search_command_verbose_logs_batch_routing(monkeypatch, tmp_path):
@@ -188,26 +195,26 @@ def test_search_command_verbose_logs_batch_routing(monkeypatch, tmp_path):
 
     result = runner.invoke(
         cli.app,
-        ["search", str(input_path), "--output", str(output_path), "--verbose"],
+        ["search", str(input_path), "--search-meta", str(output_path), "--verbose"],
     )
 
     assert result.exit_code == 0
     assert "verbose search mode=batch" in result.stderr
     assert f"input={input_path}" in result.stderr
-    assert f"output={output_path}" in result.stderr
+    assert f"search_meta={output_path}" in result.stderr
 
 
-def test_search_command_batch_mode_requires_output(monkeypatch, tmp_path):
+def test_search_command_batch_mode_writes_default_search_meta(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
     input_path = tmp_path / "input.csv"
     input_path.write_text("query\nsample movie\n", encoding="utf-8")
 
-    result = runner.invoke(cli.app, ["search", str(input_path)])
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.app, ["search", str(input_path)])
+        rows = list(csv.DictReader(open(".search_record.csv", encoding="utf-8")))
 
-    assert result.exit_code == 1
-    assert "batch search requires --output" in result.stderr
-    assert "Traceback" not in result.output
-    assert "Traceback" not in result.stderr
+    assert result.exit_code == 0
+    assert rows[0]["keyword"] == "sample movie"
 
 
 @pytest.mark.parametrize(
@@ -246,10 +253,11 @@ def test_batch_command_writes_output_csv(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
-    assert rows[0]["title"] == "Sample Result"
+    assert rows[0]["keyword"] == "sample movie"
+    assert rows[0]["result"] == "magnet:?xt=urn:btih:sample"
 
 
-def test_batch_command_all_providers_failed_exits_1_without_output(monkeypatch, tmp_path):
+def test_batch_command_records_provider_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "build_search_service", lambda: FailingService())
     input_path = tmp_path / "input.csv"
     output_path = tmp_path / "output.csv"
@@ -260,10 +268,10 @@ def test_batch_command_all_providers_failed_exits_1_without_output(monkeypatch, 
         ["batch", str(input_path), "--column", "title", "--output", str(output_path)],
     )
 
-    assert result.exit_code == 1
-    assert "all providers failed" in result.stderr
-    assert "wrote" not in result.stdout
-    assert not output_path.exists()
+    assert result.exit_code == 0
+    rows = list(csv.DictReader(output_path.open(encoding="utf-8")))
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["err"] == "all providers failed"
 
 
 def test_batch_command_deduplicates_repeated_warnings(monkeypatch, tmp_path):
@@ -303,7 +311,7 @@ def test_download_command_rejects_output_for_single_download(tmp_path):
     )
 
     assert result.exit_code == 1
-    assert "--output is only supported for CSV batch downloads" in result.stderr
+    assert "--download-meta is only supported for CSV batch downloads" in result.stderr
 
 
 def test_download_command_downloads_csv_batch_with_default_column(monkeypatch, tmp_path):
@@ -326,7 +334,7 @@ def test_download_command_writes_batch_result_csv(monkeypatch, tmp_path):
     downloader = FakeDownloader()
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
     input_path = tmp_path / "input.csv"
-    result_path = tmp_path / "results" / "download-results.csv"
+    result_path = tmp_path / "results" / "download-meta.csv"
     storage_path = tmp_path / "downloads"
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
 
@@ -337,7 +345,7 @@ def test_download_command_writes_batch_result_csv(monkeypatch, tmp_path):
             str(input_path),
             "--storage",
             str(storage_path),
-            "--output",
+            "--download_meta",
             str(result_path),
         ],
     )
@@ -347,12 +355,66 @@ def test_download_command_writes_batch_result_csv(monkeypatch, tmp_path):
         rows = list(csv.DictReader(result_file))
     assert rows == [
         {
-            "source": "magnet:?xt=urn:btih:first",
+            "keyword": "",
+            "origin": "",
+            "input": "magnet:?xt=urn:btih:first",
+            "item": "movie.mp4",
+            "path": str(storage_path / "movie.mp4"),
             "status": "success",
-            "files": json.dumps([str(storage_path / "movie.mp4")]),
-            "error": "",
+            "err": "",
         }
     ]
+
+
+def test_download_command_propagates_search_meta_to_download_meta(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
+    input_path = tmp_path / "search-meta.csv"
+    storage_path = tmp_path / "downloads"
+    download_meta = tmp_path / "download-meta.csv"
+    input_path.write_text(
+        "keyword,origin,result,status,err\n"
+        "sample movie,archive,magnet:?xt=urn:btih:first,success,\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--download-meta",
+            str(download_meta),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert downloader.calls == [("magnet:?xt=urn:btih:first", storage_path)]
+    rows = list(csv.DictReader(download_meta.open(encoding="utf-8")))
+    assert rows[0] == {
+        "keyword": "sample movie",
+        "origin": "archive",
+        "input": "magnet:?xt=urn:btih:first",
+        "item": "movie.mp4",
+        "path": str(storage_path / "movie.mp4"),
+        "status": "success",
+        "err": "",
+    }
+
+
+def test_download_command_writes_default_download_meta(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
+    input_path = tmp_path / "input.csv"
+    storage_path = tmp_path / "downloads"
+    input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["download", str(input_path), "--storage", str(storage_path)])
+
+    assert result.exit_code == 0
+    assert (storage_path / ".download_meta.csv").exists()
 
 
 def test_download_command_downloads_csv_batch_with_custom_column(monkeypatch, tmp_path):
@@ -376,7 +438,7 @@ def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\n", encoding="utf-8")
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
 
-    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
+    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None, **kwargs):
         captured["download_concurrency"] = download_concurrency
         return [], []
 
@@ -398,6 +460,39 @@ def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_
     assert captured["download_concurrency"] == 3
 
 
+def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path):
+    captured = {}
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nactive\nfresh\n", encoding="utf-8")
+
+    class ActiveDownloader(FakeDownloader):
+        def active_download_sources(self):
+            return {"active"}
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", lambda **kwargs: ActiveDownloader())
+
+    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, **kwargs):
+        captured["skip_sources"] = kwargs.get("skip_sources")
+        return [], []
+
+    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(tmp_path / "downloads"),
+            "--engine",
+            "qbittorrent",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["skip_sources"] == {"active"}
+
+
 def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch, tmp_path):
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nfirst\nsecond\nthird\nfourth\n", encoding="utf-8")
@@ -405,7 +500,7 @@ def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch,
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
     uploader = TrackingUploader()
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
-    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
 
     def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None, **kwargs):
         results = []
@@ -438,6 +533,61 @@ def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch,
     assert "uploaded 4 file(s)" in result.stdout
 
 
+def test_download_command_passes_key_gen_to_s3_uploader(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\n", encoding="utf-8")
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
+
+    def fake_build_s3_uploader(path, key_gen="hash"):
+        captured["path"] = path
+        captured["key_gen"] = key_gen
+        return FakeUploader()
+
+    monkeypatch.setattr(cli, "build_s3_uploader", fake_build_s3_uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(tmp_path / "downloads"),
+            "--upload",
+            str(upload_path),
+            "--key-gen",
+            "path",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {"path": upload_path, "key_gen": "path"}
+
+
+def test_download_command_rejects_unknown_key_gen(tmp_path):
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            "magnet:?xt=urn:btih:sample",
+            "--storage",
+            str(tmp_path / "downloads"),
+            "--upload",
+            str(upload_path),
+            "--key-gen",
+            "bad",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--key-gen must be hash or path" in result.stderr
+
+
 def test_download_command_rejects_transfer_cache_storage_without_upload(tmp_path):
     result = runner.invoke(
         cli.app,
@@ -462,7 +612,7 @@ def test_download_command_passes_transfer_cache_gate_to_batch(monkeypatch, tmp_p
     upload_path = tmp_path / "s3-upload.toml"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
-    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: FakeUploader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": FakeUploader())
 
     def fake_run_download_batch(
         input_path,
@@ -473,6 +623,7 @@ def test_download_command_passes_transfer_cache_gate_to_batch(monkeypatch, tmp_p
         on_result=None,
         before_download=None,
         raise_on_failure=None,
+        **kwargs,
     ):
         captured["before_download"] = before_download
         return [], []
@@ -506,7 +657,7 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
     uploaded_file = storage_path / "movie.mp4"
     uploader = FakeUploader()
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
-    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
 
     def fake_run_download_batch(
         input_path,
@@ -517,6 +668,7 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
         on_result=None,
         before_download=None,
         raise_on_failure=None,
+        **kwargs,
     ):
         if before_download is not None:
             before_download()
@@ -549,13 +701,189 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
     assert "uploaded 1 file(s)" in result.stdout
 
 
+def test_download_command_resumes_unuploaded_cache_before_new_batch_downloads(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\ncached\nfresh\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    cached_file = storage_path / "cached.mp4"
+    cached_file.parent.mkdir()
+    cached_file.write_text("payload", encoding="utf-8")
+    record_path = storage_path / DOWNLOAD_RECORD_FILENAME
+    record_path.write_text(
+        "keyword,origin,input,item,path,status,err\n"
+        f"cached keyword,archive,cached,cached.mp4,{cached_file},success,\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "upload-meta.csv"
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    downloader = FakeDownloader()
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--upload_meta",
+            str(output_path),
+            "--upload",
+            str(upload_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert downloader.calls == [("fresh", storage_path)]
+    assert uploader.calls[0] == ([cached_file], storage_path)
+    with output_path.open(newline="", encoding="utf-8") as result_file:
+        rows = list(csv.DictReader(result_file))
+    assert rows[0] == {
+        "keyword": "cached keyword",
+        "origin": "archive",
+        "input": "cached",
+        "item": "cached.mp4",
+        "path": "cached.mp4",
+        "s3_key": "movie.mp4",
+        "status": "success",
+        "err": "",
+    }
+
+
+def test_download_command_cleans_already_uploaded_cache_on_start_when_cleanup_enabled(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\ncached\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    cached_file = storage_path / "cached.mp4"
+    cached_file.parent.mkdir()
+    cached_file.write_text("payload", encoding="utf-8")
+    (storage_path / DOWNLOAD_RECORD_FILENAME).write_text(
+        "keyword,origin,input,item,path,status,err\n"
+        f"cached keyword,archive,cached,cached.mp4,{cached_file},success,\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "upload-results.csv"
+    output_path.write_text(
+        "keyword,origin,input,item,path,s3_key,status,err\n"
+        "cached keyword,archive,cached,cached.mp4,cached.mp4,s3://my-bucket/cached.mp4,success,\n",
+        encoding="utf-8",
+    )
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--upload_meta",
+            str(output_path),
+            "--upload",
+            str(upload_path),
+            "--transfer-cache-storage",
+            "1MB",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert not cached_file.exists()
+    assert uploader.calls == []
+    assert (storage_path / DOWNLOAD_RECORD_FILENAME).exists()
+
+
+def test_download_command_cleans_uploaded_cache_from_upload_meta_without_download_record(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfresh\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    uploaded_file = storage_path / "orphan.mp4"
+    uploaded_file.parent.mkdir()
+    uploaded_file.write_text("payload", encoding="utf-8")
+    upload_meta = storage_path / ".upload_meta.csv"
+    upload_meta.write_text(
+        "keyword,origin,input,item,path,s3_key,status,err\n"
+        "sample,archive,old,orphan.mp4,orphan.mp4,key,success,\n",
+        encoding="utf-8",
+    )
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--upload",
+            str(upload_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert not uploaded_file.exists()
+
+
+def test_download_command_writes_default_upload_meta_from_download_meta(monkeypatch, tmp_path):
+    input_path = tmp_path / "download-meta.csv"
+    storage_path = tmp_path / "downloads"
+    downloaded_file = storage_path / "movie.mp4"
+    downloaded_file.parent.mkdir()
+    downloaded_file.write_text("payload", encoding="utf-8")
+    input_path.write_text(
+        "keyword,origin,input,item,path,status,err\n"
+        f"sample movie,archive,magnet:?xt=urn:btih:first,movie.mp4,{downloaded_file},success,\n",
+        encoding="utf-8",
+    )
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--upload",
+            str(upload_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    rows = list(csv.DictReader((storage_path / ".upload_meta.csv").open(encoding="utf-8")))
+    assert rows[0] == {
+        "keyword": "sample movie",
+        "origin": "archive",
+        "input": "magnet:?xt=urn:btih:first",
+        "item": "movie.mp4",
+        "path": "movie.mp4",
+        "s3_key": "movie.mp4",
+        "status": "success",
+        "err": "",
+    }
+
+
 def test_download_command_uploads_when_upload_config_is_provided(monkeypatch, tmp_path):
     downloader = FakeDownloader()
     uploader = FakeUploader()
     upload_path = tmp_path / "s3-upload.toml"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
-    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
 
     result = runner.invoke(
         cli.app,
@@ -581,7 +909,7 @@ def test_download_command_verbose_logs_download_and_upload(monkeypatch, tmp_path
     storage_path = tmp_path / "downloads"
     upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
-    monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
 
     result = runner.invoke(
         cli.app,
@@ -644,7 +972,7 @@ def test_download_command_exits_cleanly_on_download_error(monkeypatch, tmp_path)
 def test_download_command_exits_cleanly_on_upload_config_error(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
 
-    def fail_upload(path):
+    def fail_upload(path, key_gen="hash"):
         raise UploadConfigError("bad upload config")
 
     monkeypatch.setattr(cli, "build_s3_uploader", fail_upload)

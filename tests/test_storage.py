@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,7 @@ def test_load_s3_upload_config_requires_bucket(tmp_path: Path):
         load_s3_upload_config(config_path)
 
 
-def test_s3_uploader_uploads_files_with_prefix_and_relative_paths(tmp_path: Path):
+def test_s3_uploader_defaults_to_hash_key_with_original_extension(tmp_path: Path):
     file_path = tmp_path / "downloads" / "nested" / "movie.mp4"
     file_path.parent.mkdir(parents=True)
     file_path.write_text("payload", encoding="utf-8")
@@ -59,5 +60,31 @@ def test_s3_uploader_uploads_files_with_prefix_and_relative_paths(tmp_path: Path
 
     uploaded = uploader.upload_files([file_path], base_dir=tmp_path / "downloads")
 
+    digest = hashlib.sha256("nested/movie.mp4".encode("utf-8")).hexdigest()
+    expected_key = f"magnet-search/{digest}.mp4"
+    assert uploaded == [f"s3://my-bucket/{expected_key}"]
+    assert client.uploads == [(str(file_path), "my-bucket", expected_key)]
+
+
+def test_s3_uploader_can_use_relative_path_key_generation(tmp_path: Path):
+    file_path = tmp_path / "downloads" / "nested" / "movie.mp4"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_text("payload", encoding="utf-8")
+    client = FakeS3Client()
+    config_path = tmp_path / "s3-upload.toml"
+    config_path.write_text('bucket = "my-bucket"\nprefix = "magnet-search/"\n', encoding="utf-8")
+    config = load_s3_upload_config(config_path)
+    uploader = S3Uploader(config=config, client=client, key_gen="path")
+
+    uploaded = uploader.upload_files([file_path], base_dir=tmp_path / "downloads")
+
     assert uploaded == ["s3://my-bucket/magnet-search/nested/movie.mp4"]
     assert client.uploads == [(str(file_path), "my-bucket", "magnet-search/nested/movie.mp4")]
+
+
+def test_s3_uploader_rejects_unknown_key_generation_rule(tmp_path: Path):
+    config_path = tmp_path / "s3-upload.toml"
+    config_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    config = load_s3_upload_config(config_path)
+    with pytest.raises(UploadConfigError, match="key_gen must be hash or path"):
+        S3Uploader(config=config, client=FakeS3Client(), key_gen="bad")
