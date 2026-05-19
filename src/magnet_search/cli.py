@@ -10,7 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import typer
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.table import Table
 
@@ -28,6 +28,13 @@ from magnet_search.download import (
     load_download_records,
     parse_storage_size,
     run_download_batch,
+)
+from magnet_search.metrics import (
+    MetricsItem,
+    MetricsSnapshot,
+    MetricsTracker,
+    load_metrics_snapshot,
+    snapshot_to_dict,
 )
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
 from magnet_search.providers.configurable import JsonHttpProvider
@@ -142,6 +149,123 @@ def _format_eta(seconds: int) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:d}:{secs:02d}"
+
+
+def _file_bytes(paths: list[Path]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _int_value(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_value(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _count_csv_rows(input_csv: Path) -> int:
+    with input_csv.open(newline="", encoding="utf-8-sig") as input_file:
+        return sum(1 for _ in csv.DictReader(input_file))
+
+
+def _build_metrics_tracker(metrics_db: Path | None, command: str) -> MetricsTracker | None:
+    if metrics_db is None:
+        return None
+    return MetricsTracker(metrics_db, command)
+
+
+def _finish_metrics(tracker: MetricsTracker | None, error: Exception | None = None) -> None:
+    if tracker is None:
+        return
+    if error is None:
+        tracker.complete(stage="done")
+    else:
+        tracker.fail(error)
+
+
+def _metrics_item_from_qbittorrent(info_hash: str, source: object, torrent: dict) -> MetricsItem:
+    return MetricsItem(
+        item_id=info_hash,
+        name=str(torrent.get("name", "")),
+        source=str(getattr(source, "input", getattr(source, "source", ""))),
+        state=str(torrent.get("state", "")),
+        progress=_float_value(torrent.get("progress")),
+        size_bytes=_int_value(torrent.get("size")),
+        downloaded_bytes=_int_value(torrent.get("downloaded")),
+        download_speed_bytes=_int_value(torrent.get("dlspeed")),
+        upload_speed_bytes=_int_value(torrent.get("upspeed")),
+        eta_seconds=_int_value(torrent.get("eta")),
+        seeds=_int_value(torrent.get("num_seeds")),
+        peers=_int_value(torrent.get("num_leechs")),
+        save_path=str(torrent.get("save_path", "")),
+    )
+
+
+def _render_metrics_table(snapshot: MetricsSnapshot) -> Table:
+    run = snapshot.run
+    counters = snapshot.metrics
+    table = Table(title="Runtime Metrics")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Run ID", run.run_id)
+    table.add_row("Command", run.command)
+    table.add_row("Status", run.status)
+    table.add_row("Stage", run.stage)
+    total = counters.total_items
+    done = counters.completed_items
+    percent = f"{(done / total * 100):.1f}%" if total else ""
+    table.add_row("Progress", f"{percent} {done}/{counters.failed_items}/{counters.skipped_items}/{total}")
+    table.add_row("Downloaded Files", str(counters.downloaded_files))
+    table.add_row("Uploaded Files", str(counters.uploaded_files))
+    table.add_row("Item Speed", f"{counters.items_per_second:.2f}/s")
+    table.add_row("Byte Speed", _format_speed(int(counters.bytes_per_second)))
+    table.add_row("ETA", _format_eta(counters.eta_seconds))
+    table.add_row("Last Update", f"{run.updated_at:.3f}")
+    table.add_row("Error", run.error)
+    return table
+
+
+def _render_metrics_items_table(snapshot: MetricsSnapshot) -> Table:
+    table = Table(title="Runtime Items")
+    table.add_column("Name")
+    table.add_column("State")
+    table.add_column("Progress", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Downloaded", justify="right")
+    table.add_column("Down", justify="right")
+    table.add_column("Up", justify="right")
+    table.add_column("ETA", justify="right")
+    table.add_column("Seeds", justify="right")
+    table.add_column("Peers", justify="right")
+    table.add_column("Save Path")
+    for item in snapshot.items:
+        table.add_row(
+            item.name,
+            item.state,
+            f"{item.progress * 100:.1f}%",
+            _format_bytes(item.size_bytes),
+            _format_bytes(item.downloaded_bytes),
+            _format_speed(item.download_speed_bytes),
+            _format_speed(item.upload_speed_bytes),
+            _format_eta(item.eta_seconds),
+            str(item.seeds),
+            str(item.peers),
+            item.save_path,
+        )
+    return table
 
 
 def _render_qbittorrent_monitor_table(downloads: list[QbittorrentDownloadStatus]) -> Table:
@@ -384,6 +508,7 @@ def _run_qbittorrent_seed_priority_batch(
     on_result: ResultCallback | None = None,
     raise_on_failure: bool = True,
     skip_sources: set[str] | None = None,
+    on_statuses=None,
 ) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
     sources = collect_download_sources(
         input_path,
@@ -392,11 +517,19 @@ def _run_qbittorrent_seed_priority_batch(
         result_path=download_meta,
         skip_sources=skip_sources,
     )
-    results, failures = downloader.download_sources_by_seed_priority(
-        sources,
-        storage,
-        max_active=download_concurrency,
-    )
+    if on_statuses is None:
+        results, failures = downloader.download_sources_by_seed_priority(
+            sources,
+            storage,
+            max_active=download_concurrency,
+        )
+    else:
+        results, failures = downloader.download_sources_by_seed_priority(
+            sources,
+            storage,
+            max_active=download_concurrency,
+            on_statuses=on_statuses,
+        )
     source_by_input = {source.input: source for source in sources}
     for result in results:
         append_download_record(download_meta, result, base_dir=storage)
@@ -424,15 +557,33 @@ def _run_search_batch_or_exit(
     limit: int,
     service: SearchService,
     verbose: bool = False,
+    metrics_tracker: MetricsTracker | None = None,
 ) -> None:
     warning_printer = BatchWarningPrinter()
     _verbose(verbose, f"batch input={input_csv} column={column} search_meta={search_meta} limit={limit}")
+    completed_items = 0
+    failed_items = 0
+    if metrics_tracker is not None:
+        metrics_tracker.update(stage="searching", total_items=_count_csv_rows(input_csv))
 
     def search_func(query: str, per_query_limit: int) -> list[SearchResult]:
+        nonlocal completed_items, failed_items
         _verbose(verbose, f"batch query={query} limit={per_query_limit}")
-        results, warnings = service.search(query, per_query_limit)
+        try:
+            results, warnings = service.search(query, per_query_limit)
+        except Exception:
+            failed_items += 1
+            if metrics_tracker is not None:
+                metrics_tracker.update(failed_items=failed_items)
+            raise
         warning_printer.print_once(warnings)
         _verbose(verbose, f"batch query={query} results={len(results)} warnings={len(warnings)}")
+        if results:
+            completed_items += 1
+        else:
+            failed_items += 1
+        if metrics_tracker is not None:
+            metrics_tracker.update(completed_items=completed_items, failed_items=failed_items)
         return results
 
     try:
@@ -467,29 +618,45 @@ def search(
         help="Search metadata CSV path.",
     ),
     verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
+    metrics_db: Path | None = typer.Option(None, "--metrics-db", help="Runtime metrics SQLite database path."),
 ) -> None:
+    metrics_tracker = _build_metrics_tracker(metrics_db, "search")
     service = _build_search_service_or_exit()
     if _is_csv_batch_source(query):
         _verbose(verbose, f"search mode=batch input={Path(query)} column={column} search_meta={search_meta} limit={limit}")
-        _run_search_batch_or_exit(
-            Path(query),
-            column=column,
-            search_meta=search_meta,
-            limit=limit,
-            service=service,
-            verbose=verbose,
-        )
+        try:
+            _run_search_batch_or_exit(
+                Path(query),
+                column=column,
+                search_meta=search_meta,
+                limit=limit,
+                service=service,
+                verbose=verbose,
+                metrics_tracker=metrics_tracker,
+            )
+        except Exception as error:
+            _finish_metrics(metrics_tracker, error)
+            raise
+        _finish_metrics(metrics_tracker)
         return
 
     _verbose(verbose, f"search mode=single query={query} limit={limit}")
+    if metrics_tracker is not None:
+        metrics_tracker.update(stage="searching", total_items=1)
     try:
         results, warnings = service.search(query, limit)
     except AllProvidersFailed as error:
+        if metrics_tracker is not None:
+            metrics_tracker.update(failed_items=1)
+        _finish_metrics(metrics_tracker, error)
         _print_error(error)
         raise typer.Exit(1) from error
 
     _print_warnings(warnings)
     _verbose(verbose, f"search results={len(results)} warnings={len(warnings)}")
+    if metrics_tracker is not None:
+        metrics_tracker.update(completed_items=1 if results else 0, failed_items=0 if results else 1)
+    _finish_metrics(metrics_tracker)
     if json_output:
         typer.echo(json.dumps([asdict(result) for result in results], ensure_ascii=False, indent=2))
     else:
@@ -503,9 +670,24 @@ def batch(
     output: Path = typer.Option(..., "--output", "-o", help="Output CSV path."),
     limit: int = typer.Option(3, min=1, help="Maximum results per resource."),
     verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
+    metrics_db: Path | None = typer.Option(None, "--metrics-db", help="Runtime metrics SQLite database path."),
 ) -> None:
+    metrics_tracker = _build_metrics_tracker(metrics_db, "batch")
     service = _build_search_service_or_exit()
-    _run_search_batch_or_exit(input_csv, column=column, search_meta=output, limit=limit, service=service, verbose=verbose)
+    try:
+        _run_search_batch_or_exit(
+            input_csv,
+            column=column,
+            search_meta=output,
+            limit=limit,
+            service=service,
+            verbose=verbose,
+            metrics_tracker=metrics_tracker,
+        )
+    except Exception as error:
+        _finish_metrics(metrics_tracker, error)
+        raise
+    _finish_metrics(metrics_tracker)
 
 
 @app.command("qbittorrent-monitor")
@@ -530,6 +712,53 @@ def qbittorrent_monitor(
         with Live(console=console, refresh_per_second=4, transient=False) as live:
             while True:
                 live.update(_render_qbittorrent_monitor_table(downloader.list_downloads()))
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        return
+    except Exception as error:
+        _print_error(error)
+        raise typer.Exit(1) from error
+
+
+@app.command()
+def metrics(
+    metrics_db: Path = typer.Option(..., "--metrics-db", help="Runtime metrics SQLite database path."),
+    interval: float = typer.Option(1.0, "--interval", min=0.1, help="Refresh interval in seconds."),
+    once: bool = typer.Option(False, "--once", help="Render one snapshot and exit."),
+    run_id: str | None = typer.Option(None, "--run-id", help="Metrics run id. Defaults to the latest run."),
+    json_output: bool = typer.Option(False, "--json", help="Print JSON instead of a table. Valid with --once."),
+) -> None:
+    if json_output and not once:
+        _print_error(ValueError("--json requires --once"))
+        raise typer.Exit(1)
+
+    def render_once() -> None:
+        snapshot = load_metrics_snapshot(metrics_db, run_id)
+        if snapshot is None:
+            raise ValueError(f"metrics run not found in {metrics_db}")
+        if json_output:
+            typer.echo(json.dumps(snapshot_to_dict(snapshot), ensure_ascii=False, indent=2))
+            return
+        console.print(_render_metrics_table(snapshot))
+        if snapshot.items:
+            console.print(_render_metrics_items_table(snapshot))
+
+    try:
+        if once:
+            render_once()
+            return
+
+        with Live(console=console, refresh_per_second=4, transient=False) as live:
+            while True:
+                snapshot = load_metrics_snapshot(metrics_db, run_id)
+                if snapshot is None:
+                    raise ValueError(f"metrics run not found in {metrics_db}")
+                group = (
+                    Group(_render_metrics_table(snapshot), _render_metrics_items_table(snapshot))
+                    if snapshot.items
+                    else _render_metrics_table(snapshot)
+                )
+                live.update(group)
                 time.sleep(interval)
     except KeyboardInterrupt:
         return
@@ -571,7 +800,9 @@ def download(
     qbittorrent_username: str = typer.Option("admin", help="qBittorrent Web API username."),
     qbittorrent_password: str = typer.Option("", help="qBittorrent Web API password."),
     verbose: bool = typer.Option(False, "--verbose", help="Print detailed process logs to stderr."),
+    metrics_db: Path | None = typer.Option(None, "--metrics-db", help="Runtime metrics SQLite database path."),
 ) -> None:
+    metrics_tracker = _build_metrics_tracker(metrics_db, "download")
     try:
         if transfer_cache_storage is not None and upload is None:
             _print_error(ValueError("--transfer-cache-storage requires --upload"))
@@ -590,6 +821,8 @@ def download(
         is_batch = _is_csv_batch_source(source)
         is_download_meta = _is_download_meta_source(Path(source)) if is_batch else False
         mode = "batch" if is_batch else "single"
+        if metrics_tracker is not None:
+            metrics_tracker.update(stage="downloading", total_items=_count_csv_rows(Path(source)) if is_batch else 1)
         if download_meta is not None and not is_batch:
             _print_error(ValueError("--download-meta is only supported for CSV batch downloads"))
             raise typer.Exit(1)
@@ -628,6 +861,29 @@ def download(
             if startup_results:
                 _verbose(verbose, f"download recovered startup items={len(startup_results)}")
 
+        def update_download_metrics(results: list[DownloadResult], failures: list[tuple[str, Exception]] | None = None) -> None:
+            if metrics_tracker is None:
+                return
+            failures = failures or []
+            metrics_tracker.update(
+                stage="downloading",
+                completed_items=len(results),
+                failed_items=len(failures),
+                downloaded_files=sum(len(result.files) for result in results),
+                bytes_downloaded=sum(_file_bytes(result.files) for result in results),
+            )
+
+        def update_qbittorrent_item_metrics(statuses) -> None:
+            if metrics_tracker is None:
+                return
+            items = [_metrics_item_from_qbittorrent(info_hash, status_source, torrent) for info_hash, status_source, torrent in statuses]
+            metrics_tracker.replace_items(items)
+            metrics_tracker.update(
+                stage="downloading",
+                bytes_per_second=sum(item.download_speed_bytes for item in items),
+                eta_seconds=max((item.eta_seconds for item in items), default=0),
+            )
+
         if uploader is None:
             if is_batch:
                 active_sources = _active_download_sources(downloader) | startup_sources
@@ -640,6 +896,7 @@ def download(
                         download_concurrency,
                         resolved_download_meta,
                         skip_sources=active_sources or None,
+                        on_statuses=update_qbittorrent_item_metrics if metrics_tracker is not None else None,
                     )
                 else:
                     batch_kwargs = {
@@ -655,13 +912,16 @@ def download(
                     results, _ = run_download_batch(**batch_kwargs)
                 all_results = startup_results + results
                 file_count = sum(len(result.files) for result in all_results)
+                update_download_metrics(all_results)
                 _verbose(verbose, f"download completed items={len(all_results)} files={file_count}")
                 typer.echo(f"downloaded {len(all_results)} item(s), {file_count} file(s)")
             else:
                 result = downloader.download(source, storage)
                 append_download_record(storage, DownloadResult(result.magnet, result.files, input=source))
+                update_download_metrics([DownloadResult(result.magnet, result.files, input=source)])
                 _verbose(verbose, f"download completed files={len(result.files)}")
                 typer.echo(f"downloaded {len(result.files)} file(s)")
+            _finish_metrics(metrics_tracker)
             return
 
         upload_futures: dict[Future[list[str]], DownloadResult] = {}
@@ -710,6 +970,17 @@ def download(
                     error_str = str(error)
 
                 uploaded += len(s3_keys)
+                if metrics_tracker is not None:
+                    metrics_tracker.update(
+                        stage="uploading",
+                        uploaded_files=uploaded,
+                        bytes_uploaded=sum(
+                            _file_bytes(completed_result.files)
+                            for completed_result in upload_futures.values()
+                            if completed_result is not result
+                        )
+                        + _file_bytes(result.files),
+                    )
 
                 if csv_writer is not None:
                     if result.files:
@@ -773,12 +1044,14 @@ def download(
                         on_result=enqueue_upload,
                         raise_on_failure=False,
                         skip_sources=batch_kwargs.get("skip_sources"),
+                        on_statuses=update_qbittorrent_item_metrics if metrics_tracker is not None else None,
                     )
                 else:
                     if transfer_cache is not None:
                         batch_kwargs["before_download"] = transfer_cache.wait_for_space
                     download_results, download_failures = run_download_batch(**batch_kwargs)
                 file_count = sum(len(result.files) for result in download_results)
+                update_download_metrics(startup_results + download_results, download_failures)
                 _verbose(verbose, f"download completed items={len(download_results)} files={file_count}")
                 typer.echo(f"downloaded {len(download_results)} item(s), {file_count} file(s)")
             else:
@@ -788,6 +1061,7 @@ def download(
                     append_download_record(storage, result)
                     download_results.append(result)
                     enqueue_upload(result)
+                    update_download_metrics(download_results)
                     _verbose(verbose, f"download completed files={len(result.files)}")
                     typer.echo(f"downloaded {len(result.files)} file(s)")
 
@@ -802,7 +1076,9 @@ def download(
 
         if csv_file is not None:
             csv_file.close()
+        _finish_metrics(metrics_tracker)
     except (DownloadError, UploadConfigError, UploadError, tomllib.TOMLDecodeError, OSError) as error:
+        _finish_metrics(metrics_tracker, error)
         _print_error(error)
         raise typer.Exit(1) from error
 

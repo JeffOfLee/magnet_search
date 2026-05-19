@@ -130,6 +130,27 @@ The search, download, and upload stages can be restarted after interruption:
 
 Add `--verbose` to print detailed process logs to stderr. Normal stdout remains unchanged, so JSON output and CSV file outputs stay parseable.
 
+## Runtime Metrics
+
+Long-running search, batch, download, and upload commands can write runtime metrics to a SQLite database with `--metrics-db`:
+
+```bash
+magnet-search search input.csv --metrics-db .metrics.sqlite
+magnet-search batch input.csv --column title --output results.csv --metrics-db .metrics.sqlite
+magnet-search download input.csv --storage downloads/ --metrics-db downloads/.metrics.sqlite
+magnet-search download input.csv --storage downloads/ --upload s3-upload.toml --metrics-db downloads/.metrics.sqlite
+```
+
+Watch the latest run from another terminal:
+
+```bash
+magnet-search metrics --metrics-db downloads/.metrics.sqlite --interval 1
+magnet-search metrics --metrics-db downloads/.metrics.sqlite --once
+magnet-search metrics --metrics-db downloads/.metrics.sqlite --once --json
+```
+
+Metrics include command status, stage, item counters, transfer counters, speeds, ETA, last error, and qBittorrent per-item snapshots when available. Metrics are opt-in, so existing stdout, CSV output, and filesystem behavior are unchanged when `--metrics-db` is omitted.
+
 Example `s3-upload.toml`:
 
 ```toml

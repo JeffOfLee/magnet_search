@@ -149,6 +149,7 @@ class QbittorrentDownloader:
         sources: list[object],
         output_dir: Path,
         max_active: int,
+        on_statuses=None,
     ) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
         if max_active < 1:
             raise DownloadError("max_active must be at least 1")
@@ -171,6 +172,14 @@ class QbittorrentDownloader:
 
         while tracked:
             torrents_by_hash = self._tracked_torrents(tracked.keys())
+            if on_statuses is not None:
+                on_statuses(
+                    [
+                        (info_hash, tracked[info_hash], torrent)
+                        for info_hash, torrent in torrents_by_hash.items()
+                        if info_hash in tracked
+                    ]
+                )
             for info_hash in list(tracked):
                 torrent = torrents_by_hash.get(info_hash)
                 source = tracked[info_hash]

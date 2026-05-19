@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from magnet_search import cli
 from magnet_search.config import ConfigError
 from magnet_search.download import DOWNLOAD_RECORD_FILENAME, DownloadError
+from magnet_search.metrics import MetricsTracker, load_metrics_snapshot
 from magnet_search.qbittorrent import QbittorrentDownloadStatus
 from magnet_search.storage import UploadConfigError
 from magnet_search.models import AllProvidersFailed, ProviderWarning, SearchResult
@@ -218,6 +219,28 @@ def test_search_command_batch_mode_writes_default_search_meta(monkeypatch, tmp_p
     assert rows[0]["keyword"] == "sample movie"
 
 
+def test_search_command_writes_runtime_metrics_for_batch(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+    input_path = tmp_path / "input.csv"
+    metrics_db = tmp_path / "metrics.sqlite"
+    search_meta = tmp_path / "search-meta.csv"
+    input_path.write_text("query\nsample movie\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        ["search", str(input_path), "--search-meta", str(search_meta), "--metrics-db", str(metrics_db)],
+    )
+
+    snapshot = load_metrics_snapshot(metrics_db)
+    assert result.exit_code == 0
+    assert snapshot is not None
+    assert snapshot.run.command == "search"
+    assert snapshot.run.status == "completed"
+    assert snapshot.run.stage == "done"
+    assert snapshot.metrics.total_items == 1
+    assert snapshot.metrics.completed_items == 1
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -291,6 +314,36 @@ def test_batch_command_deduplicates_repeated_warnings(monkeypatch, tmp_path):
     assert result.stderr.count("temporary issue") == 1
 
 
+def test_batch_command_writes_runtime_metrics(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "build_search_service", lambda: FakeService())
+    input_path = tmp_path / "input.csv"
+    output_path = tmp_path / "output.csv"
+    metrics_db = tmp_path / "metrics.sqlite"
+    input_path.write_text("title\nfirst\nsecond\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "batch",
+            str(input_path),
+            "--column",
+            "title",
+            "--output",
+            str(output_path),
+            "--metrics-db",
+            str(metrics_db),
+        ],
+    )
+
+    snapshot = load_metrics_snapshot(metrics_db)
+    assert result.exit_code == 0
+    assert snapshot is not None
+    assert snapshot.run.command == "batch"
+    assert snapshot.run.status == "completed"
+    assert snapshot.metrics.total_items == 2
+    assert snapshot.metrics.completed_items == 2
+
+
 def test_download_command_downloads_single_magnet(monkeypatch, tmp_path):
     downloader = FakeDownloader()
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
@@ -303,6 +356,28 @@ def test_download_command_downloads_single_magnet(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert downloader.calls == [("magnet:?xt=urn:btih:sample", tmp_path / "downloads")]
     assert "downloaded 1 file(s)" in result.stdout
+
+
+def test_download_command_writes_runtime_metrics_for_batch(monkeypatch, tmp_path):
+    downloader = FakeDownloader()
+    monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: downloader)
+    input_path = tmp_path / "input.csv"
+    metrics_db = tmp_path / "metrics.sqlite"
+    input_path.write_text("magnet\nfirst\nsecond\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        ["download", str(input_path), "--storage", str(tmp_path / "downloads"), "--metrics-db", str(metrics_db)],
+    )
+
+    snapshot = load_metrics_snapshot(metrics_db)
+    assert result.exit_code == 0
+    assert snapshot is not None
+    assert snapshot.run.command == "download"
+    assert snapshot.run.status == "completed"
+    assert snapshot.metrics.total_items == 2
+    assert snapshot.metrics.completed_items == 2
+    assert snapshot.metrics.downloaded_files == 2
 
 
 def test_download_command_rejects_output_for_single_download(tmp_path):
@@ -598,6 +673,72 @@ def test_download_command_routes_qbittorrent_batch_to_seed_priority_scheduler(mo
     assert "downloaded 3 item(s), 3 file(s)" in result.stdout
 
 
+def test_download_command_records_qbittorrent_item_metrics(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    metrics_db = tmp_path / "metrics.sqlite"
+
+    class SeedPriorityDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def startup_download_results(self, storage):
+            return []
+
+        def active_download_sources(self):
+            return set()
+
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_statuses=None):
+            if on_statuses is not None:
+                on_statuses(
+                    [
+                        (
+                            "hash-1",
+                            sources[0],
+                            {
+                                "name": "Ubuntu ISO",
+                                "state": "downloading",
+                                "progress": 0.5,
+                                "size": 2_000_000,
+                                "downloaded": 1_000_000,
+                                "dlspeed": 500_000,
+                                "upspeed": 10_000,
+                                "eta": 60,
+                                "num_seeds": 7,
+                                "num_leechs": 3,
+                                "save_path": str(output_dir),
+                            },
+                        )
+                    ]
+                )
+            return [], []
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", SeedPriorityDownloader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--engine",
+            "qbittorrent",
+            "--metrics-db",
+            str(metrics_db),
+        ],
+    )
+
+    snapshot = load_metrics_snapshot(metrics_db)
+    assert result.exit_code == 0
+    assert snapshot is not None
+    assert len(snapshot.items) == 1
+    assert snapshot.items[0].item_id == "hash-1"
+    assert snapshot.items[0].name == "Ubuntu ISO"
+    assert snapshot.items[0].download_speed_bytes == 500_000
+
+
 def test_download_command_uploads_qbittorrent_seed_priority_batch_results(monkeypatch, tmp_path):
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nfirst\nsecond\n", encoding="utf-8")
@@ -745,6 +886,21 @@ def test_qbittorrent_monitor_renders_all_current_downloads_once(monkeypatch):
     assert "Finished Dataset" in result.stdout
     assert "uploading" in result.stdout
     assert "100.0%" in result.stdout
+
+
+def test_metrics_command_renders_json_snapshot(tmp_path):
+    metrics_db = tmp_path / "metrics.sqlite"
+    tracker = MetricsTracker(metrics_db, "download", run_id="run-1")
+    tracker.update(stage="downloading", total_items=2, completed_items=1)
+
+    result = runner.invoke(cli.app, ["metrics", "--metrics-db", str(metrics_db), "--once", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["run"]["run_id"] == "run-1"
+    assert payload["run"]["command"] == "download"
+    assert payload["metrics"]["total_items"] == 2
+    assert payload["metrics"]["completed_items"] == 1
 
 
 def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch, tmp_path):
