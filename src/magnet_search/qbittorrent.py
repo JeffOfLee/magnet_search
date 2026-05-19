@@ -30,13 +30,14 @@ def _torrent_info_hash(data: bytes) -> str:
     info_start = data.find(b"4:infod")
     if info_start == -1:
         return ""
-    depth = 0
-    pos = info_start + 6
+    info_value_start = info_start + 6
+    pos = info_value_start + 1
+    depth = 1
     while pos < len(data):
         if data[pos : pos + 1] == b"e":
             depth -= 1
-            if depth < 0:
-                return hashlib.sha1(data[info_start + 6 : pos + 1]).hexdigest()
+            if depth == 0:
+                return hashlib.sha1(data[info_value_start : pos + 1]).hexdigest()
             pos += 1
             continue
         if data[pos : pos + 1] == b"d" or data[pos : pos + 1] == b"l":
@@ -62,6 +63,7 @@ class QbittorrentDownloader:
         poll_interval: float = 5.0,
         http_timeout: float = 30.0,
         no_seed_checks: int = 3,
+        verbose: bool = False,
     ):
         self.url = url.rstrip("/")
         self.username = username
@@ -69,7 +71,12 @@ class QbittorrentDownloader:
         self.poll_interval = poll_interval
         self.http_timeout = http_timeout
         self.no_seed_checks = no_seed_checks
+        self.verbose = verbose
         self._session: httpx.Client | None = None
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[qbittorrent] {msg}", flush=True)
 
     def _client(self) -> httpx.Client:
         if self._session is not None:
@@ -119,14 +126,18 @@ class QbittorrentDownloader:
         if not source:
             raise DownloadError("download source must be non-empty")
 
+        source_path = Path(source)
+        short_name = source_path.name if source_path.suffix.lower() == ".torrent" else source
+        self._log(f"download start: {short_name}")
+
         output_dir.mkdir(parents=True, exist_ok=True)
         before = _snapshot_files(output_dir)
 
         existing_hashes = self._get_hashes()
 
         already_exists = False
-        source_path = Path(source)
         if source_path.suffix.lower() == ".torrent" and source_path.exists():
+            self._log(f"adding torrent file: {source_path.name} ({source_path.stat().st_size / 1024:.0f} KB)")
             torrent_data = source_path.read_bytes()
             files_payload = {"torrents": (source_path.name, torrent_data, "application/x-bittorrent")}
             try:
@@ -137,10 +148,12 @@ class QbittorrentDownloader:
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
+                    self._log("torrent already exists in qBittorrent (409)")
                     already_exists = True
                 else:
                     raise
         else:
+            self._log(f"adding magnet/url: {source[:80]}")
             try:
                 response = self._api_post(
                     "/api/v2/torrents/add",
@@ -148,6 +161,7 @@ class QbittorrentDownloader:
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
+                    self._log("torrent already exists in qBittorrent (409)")
                     already_exists = True
                 else:
                     raise
@@ -168,20 +182,25 @@ class QbittorrentDownloader:
                 info_hash = self._find_new_hash(self._get_hashes())
             if not info_hash:
                 raise DownloadError("qBittorrent could not find already-existing torrent hash")
+            self._log(f"found existing hash: {info_hash}")
         else:
             info_hash = self._find_new_hash(existing_hashes)
             if info_hash is None:
                 raise DownloadError("qBittorrent could not find added torrent")
+            self._log(f"found new hash: {info_hash}")
 
         self._wait_for_completion(info_hash)
 
         after = _snapshot_files(output_dir)
+        new_files = _changed_files(before, after)
+        self._log(f"download done: {len(new_files)} file(s)")
 
         self._remove_torrent(info_hash)
 
-        return DownloadResult(magnet=source, files=_changed_files(before, after))
+        return DownloadResult(magnet=source, files=new_files)
 
     def _remove_torrent(self, info_hash: str) -> None:
+        self._log(f"removing torrent: {info_hash}")
         try:
             self._api_post("/api/v2/torrents/delete", data={"hashes": info_hash, "deleteFiles": "false"})
         except Exception:
@@ -294,21 +313,24 @@ class QbittorrentDownloader:
         return []
 
     def _find_new_hash(self, existing_hashes: set[str]) -> str | None:
-        for _ in range(10):
+        for attempt in range(10):
             time.sleep(1)
             try:
                 response = self._api_get("/api/v2/torrents/info")
                 current = {t["hash"]: t for t in response.json()}
                 for h, t in current.items():
                     if h not in existing_hashes and t.get("state") not in ("unknown",):
+                        self._log(f"hash detected on attempt {attempt + 1}")
                         return h
             except Exception:
                 time.sleep(1)
+        self._log("hash detection timed out after 10 attempts")
         return None
 
     def _wait_for_completion(self, info_hash: str) -> None:
         completed_states = frozenset(("pausedUP", "uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP"))
         no_seed_count = 0
+        last_log_progress = -1.0
         while True:
             try:
                 response = self._api_get("/api/v2/torrents/info", params={"hashes": info_hash})
@@ -320,6 +342,18 @@ class QbittorrentDownloader:
                 state = torrent.get("state", "")
                 progress = torrent.get("progress", 0)
 
+                if progress - last_log_progress >= 0.05 or state != "downloading":
+                    dlspeed = torrent.get("dlspeed", 0)
+                    seeds = torrent.get("num_seeds", 0)
+                    size = torrent.get("size", 0)
+                    amount_left = torrent.get("amount_left", 0)
+                    name = torrent.get("name", "")
+                    speed_str = self._fmt_speed(dlspeed)
+                    size_str = self._fmt_size(size)
+                    left_str = self._fmt_size(amount_left)
+                    self._log(f"  {progress*100:.1f}%  {speed_str}/s  seeds={seeds}  left={left_str}/{size_str}  {state}  {name}")
+                    last_log_progress = progress
+
                 if state in ("error", "missingFiles"):
                     raise DownloadError(f"qBittorrent torrent error state: {state}")
                 if state in completed_states and progress >= 1.0:
@@ -327,6 +361,7 @@ class QbittorrentDownloader:
                 if self._has_no_active_seeds(torrent):
                     no_seed_count += 1
                     if no_seed_count >= self.no_seed_checks:
+                        self._log(f"no active seeds for {self.no_seed_checks} polls, removing")
                         self._remove_torrent(info_hash)
                         raise DownloadError("qBittorrent torrent has no active seeds")
                 else:
@@ -336,6 +371,32 @@ class QbittorrentDownloader:
             except Exception:
                 pass
             time.sleep(self.poll_interval)
+
+    @staticmethod
+    def _fmt_speed(bps: object) -> str:
+        try:
+            b = int(bps)
+        except (TypeError, ValueError):
+            return "0 B"
+        if b >= 1048576:
+            return f"{b / 1048576:.1f} MB"
+        if b >= 1024:
+            return f"{b / 1024:.0f} KB"
+        return f"{b} B"
+
+    @staticmethod
+    def _fmt_size(b: object) -> str:
+        try:
+            b = int(b)
+        except (TypeError, ValueError):
+            return "0 B"
+        if b >= 1073741824:
+            return f"{b / 1073741824:.1f} GB"
+        if b >= 1048576:
+            return f"{b / 1048576:.1f} MB"
+        if b >= 1024:
+            return f"{b / 1024:.0f} KB"
+        return f"{b} B"
 
     def _has_no_active_seeds(self, torrent: dict) -> bool:
         seeds = torrent.get("num_seeds")

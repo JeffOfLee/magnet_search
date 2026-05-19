@@ -557,6 +557,7 @@ def download(
                 url=qbittorrent_url,
                 username=qbittorrent_username,
                 password=qbittorrent_password,
+                verbose=verbose,
             )
         else:
             downloader = build_downloader(verbose=verbose)
