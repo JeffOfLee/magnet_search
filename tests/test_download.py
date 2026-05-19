@@ -124,7 +124,7 @@ def test_run_download_batch_uses_default_magnet_column(tmp_path: Path):
     input_path.write_text("magnet\nmagnet:?xt=urn:btih:first\nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
     downloader = Aria2cDownloader(runner=FakeRunner(output_dir))
 
-    results = run_download_batch(input_path, column="magnet", output_dir=output_dir, downloader=downloader)
+    results, _ = run_download_batch(input_path, column="magnet", output_dir=output_dir, downloader=downloader)
 
     assert [result.magnet for result in results] == [
         "magnet:?xt=urn:btih:first",
@@ -138,7 +138,7 @@ def test_run_download_batch_uses_custom_column_and_skips_blank_rows(tmp_path: Pa
     input_path.write_text("link\nmagnet:?xt=urn:btih:first\n   \nmagnet:?xt=urn:btih:second\n", encoding="utf-8")
     downloader = Aria2cDownloader(runner=FakeRunner(output_dir))
 
-    results = run_download_batch(input_path, column="link", output_dir=output_dir, downloader=downloader)
+    results, _ = run_download_batch(input_path, column="link", output_dir=output_dir, downloader=downloader)
 
     assert [result.magnet for result in results] == [
         "magnet:?xt=urn:btih:first",
@@ -159,7 +159,7 @@ def test_run_download_batch_resolves_relative_torrent_paths_from_csv_directory(t
     runner = FakeRunner(output_dir)
     downloader = Aria2cDownloader(runner=runner)
 
-    results = run_download_batch(input_path, column="source", output_dir=output_dir, downloader=downloader)
+    results, _ = run_download_batch(input_path, column="source", output_dir=output_dir, downloader=downloader)
 
     assert runner.calls[0]["command"][-1] == str(torrent_path)
     assert results[0].magnet == str(torrent_path)
@@ -174,7 +174,7 @@ def test_run_download_batch_respects_download_concurrency(tmp_path: Path):
     )
     downloader = TrackingDownloader()
 
-    results = run_download_batch(
+    results, _ = run_download_batch(
         input_path,
         column="magnet",
         output_dir=output_dir,

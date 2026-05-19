@@ -378,7 +378,7 @@ def test_download_command_passes_download_concurrency_to_batch(monkeypatch, tmp_
 
     def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
         captured["download_concurrency"] = download_concurrency
-        return []
+        return [], []
 
     monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
 
@@ -407,14 +407,14 @@ def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch,
     monkeypatch.setattr(cli, "build_downloader", lambda verbose=False: FakeDownloader())
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path: uploader)
 
-    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None):
+    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, on_result=None, **kwargs):
         results = []
         for index in range(4):
             result = cli.DownloadResult(magnet=f"source-{index}", files=[output_dir / f"movie-{index}.mp4"])
             results.append(result)
             if on_result is not None:
                 on_result(result)
-        return results
+        return results, []
 
     monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
 
@@ -472,9 +472,10 @@ def test_download_command_passes_transfer_cache_gate_to_batch(monkeypatch, tmp_p
         download_concurrency,
         on_result=None,
         before_download=None,
+        raise_on_failure=None,
     ):
         captured["before_download"] = before_download
-        return []
+        return [], []
 
     monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
 
@@ -515,6 +516,7 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
         download_concurrency,
         on_result=None,
         before_download=None,
+        raise_on_failure=None,
     ):
         if before_download is not None:
             before_download()
@@ -523,7 +525,7 @@ def test_download_command_cleans_uploaded_files_when_transfer_cache_is_enabled(m
         result = cli.DownloadResult(magnet="first", files=[uploaded_file])
         if on_result is not None:
             on_result(result)
-        return [result]
+        return [result], []
 
     monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
 

@@ -1,11 +1,40 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from pathlib import Path
 
 import httpx
 
 from magnet_search.download import DownloadError, DownloadResult, _snapshot_files, _changed_files
+
+
+def _torrent_info_hash(data: bytes) -> str:
+    info_start = data.find(b"4:infod")
+    if info_start == -1:
+        return ""
+    depth = 0
+    pos = info_start + 6
+    while pos < len(data):
+        if data[pos : pos + 1] == b"e":
+            depth -= 1
+            if depth < 0:
+                return hashlib.sha1(data[info_start + 6 : pos + 1]).hexdigest()
+            pos += 1
+            continue
+        if data[pos : pos + 1] == b"d" or data[pos : pos + 1] == b"l":
+            depth += 1
+            pos += 1
+            continue
+        if data[pos : pos + 1] == b"i":
+            end = data.index(b"e", pos)
+            pos = end + 1
+            continue
+        colon = data.index(b":", pos)
+        length = int(data[pos:colon])
+        pos = colon + 1 + length
+    return ""
 
 
 class QbittorrentDownloader:
@@ -27,7 +56,7 @@ class QbittorrentDownloader:
     def _client(self) -> httpx.Client:
         if self._session is not None:
             return self._session
-        self._session = httpx.Client(timeout=self.http_timeout)
+        self._session = httpx.Client(timeout=self.http_timeout, trust_env=False)
         self._login()
         return self._session
 
@@ -36,22 +65,34 @@ class QbittorrentDownloader:
             f"{self.url}/api/v2/auth/login",
             data={"username": self.username, "password": self.password},
         )
-        if response.text.strip() != "Ok.":
+        if response.status_code not in (200, 204) or (response.status_code == 200 and response.text.strip() != "Ok."):
             raise DownloadError(f"qBittorrent login failed: {response.text.strip()}")
 
+    _retry_statuses = frozenset((502, 503, 504))
+
     def _api_get(self, endpoint: str, params: dict | None = None) -> httpx.Response:
-        response = self._client().get(f"{self.url}{endpoint}", params=params)
-        if response.status_code == 403:
-            self._login()
+        for attempt in range(5):
             response = self._client().get(f"{self.url}{endpoint}", params=params)
+            if response.status_code == 403:
+                self._login()
+                response = self._client().get(f"{self.url}{endpoint}", params=params)
+            if response.status_code not in self._retry_statuses:
+                response.raise_for_status()
+                return response
+            time.sleep(2 ** attempt)
         response.raise_for_status()
         return response
 
     def _api_post(self, endpoint: str, data: dict | None = None, files: dict | None = None) -> httpx.Response:
-        response = self._client().post(f"{self.url}{endpoint}", data=data, files=files)
-        if response.status_code == 403:
-            self._login()
+        for attempt in range(5):
             response = self._client().post(f"{self.url}{endpoint}", data=data, files=files)
+            if response.status_code == 403:
+                self._login()
+                response = self._client().post(f"{self.url}{endpoint}", data=data, files=files)
+            if response.status_code not in self._retry_statuses:
+                response.raise_for_status()
+                return response
+            time.sleep(2 ** attempt)
         response.raise_for_status()
         return response
 
@@ -65,27 +106,54 @@ class QbittorrentDownloader:
 
         existing_hashes = self._get_hashes()
 
+        already_exists = False
         source_path = Path(source)
         if source_path.suffix.lower() == ".torrent" and source_path.exists():
-            with open(source_path, "rb") as fh:
-                files_payload = {"torrents": (source_path.name, fh, "application/x-bittorrent")}
+            torrent_data = source_path.read_bytes()
+            files_payload = {"torrents": (source_path.name, torrent_data, "application/x-bittorrent")}
+            try:
                 response = self._api_post(
                     "/api/v2/torrents/add",
                     data={"savepath": str(output_dir)},
                     files=files_payload,
                 )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    already_exists = True
+                else:
+                    raise
         else:
-            response = self._api_post(
-                "/api/v2/torrents/add",
-                data={"urls": source, "savepath": str(output_dir)},
-            )
+            try:
+                response = self._api_post(
+                    "/api/v2/torrents/add",
+                    data={"urls": source, "savepath": str(output_dir)},
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    already_exists = True
+                else:
+                    raise
 
-        if response.text.strip() != "Ok.":
-            raise DownloadError(f"qBittorrent failed to add torrent: {response.text.strip()}")
+        if not already_exists:
+            if response.text.strip() and response.text.strip() != "Ok.":
+                try:
+                    result = json.loads(response.text)
+                    if result.get("success_count", 0) == 0:
+                        raise DownloadError(f"qBittorrent failed to add torrent: {response.text.strip()}")
+                except json.JSONDecodeError:
+                    raise DownloadError(f"qBittorrent failed to add torrent: {response.text.strip()}")
 
-        info_hash = self._find_new_hash(existing_hashes)
-        if info_hash is None:
-            raise DownloadError("qBittorrent could not find added torrent")
+        if already_exists:
+            if source_path.suffix.lower() == ".torrent" and source_path.exists():
+                info_hash = _torrent_info_hash(source_path.read_bytes())
+            else:
+                info_hash = self._find_new_hash(self._get_hashes())
+            if not info_hash:
+                raise DownloadError("qBittorrent could not find already-existing torrent hash")
+        else:
+            info_hash = self._find_new_hash(existing_hashes)
+            if info_hash is None:
+                raise DownloadError("qBittorrent could not find added torrent")
 
         self._wait_for_completion(info_hash)
 

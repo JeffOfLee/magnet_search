@@ -14,6 +14,10 @@ from typing import Any, Callable
 class DownloadError(RuntimeError):
     """Raised when a magnet download or download batch cannot complete."""
 
+    def __init__(self, message: str, failures: list[tuple[str, Exception]] | None = None):
+        super().__init__(message)
+        self.failures = failures or []
+
 
 @dataclass(frozen=True)
 class DownloadResult:
@@ -25,6 +29,50 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 ResultCallback = Callable[[DownloadResult], None]
 BeforeDownloadCallback = Callable[[], None]
 RESULT_FIELDS = ["source", "status", "files", "error"]
+UPLOAD_RESULT_FIELDS = ["source", "status", "file", "s3_key", "error"]
+
+
+def write_upload_results_csv(
+    result_path: Path,
+    results: list[DownloadResult],
+    failures: list[tuple[str, Exception]],
+    upload_map: dict[str, list[str]],
+) -> None:
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    with result_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=UPLOAD_RESULT_FIELDS)
+        writer.writeheader()
+
+        for result in results:
+            s3_keys = upload_map.get(result.magnet, [])
+            if result.files:
+                for i, file_path in enumerate(result.files):
+                    s3_key = s3_keys[i] if i < len(s3_keys) else ""
+                    writer.writerow({
+                        "source": result.magnet,
+                        "status": "uploaded",
+                        "file": str(file_path),
+                        "s3_key": s3_key,
+                        "error": "",
+                    })
+            else:
+                writer.writerow({
+                    "source": result.magnet,
+                    "status": "uploaded",
+                    "file": "",
+                    "s3_key": "",
+                    "error": "",
+                })
+
+        for source, error in failures:
+            writer.writerow({
+                "source": source,
+                "status": "failed",
+                "file": "",
+                "s3_key": "",
+                "error": str(error),
+            })
+        f.flush()
 
 
 _STORAGE_SIZE_PATTERN = re.compile(r"^\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[a-zA-Z]*)\s*$")
@@ -261,7 +309,8 @@ def run_download_batch(
     on_result: ResultCallback | None = None,
     before_download: BeforeDownloadCallback | None = None,
     result_path: Path | None = None,
-) -> list[DownloadResult]:
+    raise_on_failure: bool = True,
+) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
     if download_concurrency < 1:
         raise DownloadError("download_concurrency must be at least 1")
 
@@ -280,7 +329,7 @@ def run_download_batch(
 
         recorder_context = _ResultRecorder(result_path) if result_path is not None else None
         if recorder_context is None:
-            return _run_downloads(
+            results, failures = _run_downloads(
                 sources,
                 output_dir,
                 downloader,
@@ -290,19 +339,23 @@ def run_download_batch(
                 failures,
                 results,
             )
+        else:
+            with recorder_context as recorder:
+                results, failures = _run_downloads(
+                    sources,
+                    output_dir,
+                    downloader,
+                    download_concurrency,
+                    on_result,
+                    before_download,
+                    failures,
+                    results,
+                    recorder,
+                )
 
-        with recorder_context as recorder:
-            return _run_downloads(
-                sources,
-                output_dir,
-                downloader,
-                download_concurrency,
-                on_result,
-                before_download,
-                failures,
-                results,
-                recorder,
-            )
+    if failures and raise_on_failure:
+        raise DownloadError(_failure_message(failures), failures=failures)
+    return results, failures
 
 
 def _run_downloads(
@@ -315,7 +368,7 @@ def _run_downloads(
     failures: list[tuple[str, Exception]],
     results: list[DownloadResult],
     recorder: _ResultRecorder | None = None,
-) -> list[DownloadResult]:
+) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
     if download_concurrency == 1:
         for source in sources:
             try:
@@ -358,6 +411,4 @@ def _run_downloads(
                     on_result(result)
             results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
 
-    if failures:
-        raise DownloadError(_failure_message(failures))
-    return results
+    return results, failures

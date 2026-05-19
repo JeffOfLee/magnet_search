@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -297,7 +298,7 @@ def download(
                 }
                 if output is not None:
                     batch_kwargs["result_path"] = output
-                results = run_download_batch(**batch_kwargs)
+                results, _ = run_download_batch(**batch_kwargs)
                 file_count = sum(len(result.files) for result in results)
                 _verbose(verbose, f"download completed items={len(results)} files={file_count}")
                 typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
@@ -307,8 +308,19 @@ def download(
                 typer.echo(f"downloaded {len(result.files)} file(s)")
             return
 
-        upload_futures: list[Future[list[str]]] = []
-        download_error: DownloadError | None = None
+        upload_futures: dict[Future[list[str]], DownloadResult] = {}
+        download_results: list[DownloadResult] = []
+        download_failures: list[tuple[str, Exception]] = []
+
+        csv_file = None
+        csv_writer = None
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            csv_file = output.open("w", newline="", encoding="utf-8")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=["source", "status", "file", "s3_key", "error"])
+            csv_writer.writeheader()
+            csv_file.flush()
+
         with ThreadPoolExecutor(max_workers=upload_concurrency) as upload_executor:
 
             def enqueue_upload(result: DownloadResult) -> None:
@@ -322,41 +334,87 @@ def download(
                         if completed.exception() is not None
                         else None
                     )
-                upload_futures.append(future)
+                upload_futures[future] = result
 
             if is_batch:
-                try:
-                    batch_kwargs = {
-                        "input_path": Path(source),
-                        "column": column,
-                        "output_dir": storage,
-                        "downloader": downloader,
-                        "download_concurrency": download_concurrency,
-                        "on_result": enqueue_upload,
-                    }
-                    if output is not None:
-                        batch_kwargs["result_path"] = output
-                    if transfer_cache is None:
-                        results = run_download_batch(**batch_kwargs)
-                    else:
-                        batch_kwargs["before_download"] = transfer_cache.wait_for_space
-                        results = run_download_batch(**batch_kwargs)
-                    file_count = sum(len(result.files) for result in results)
-                    _verbose(verbose, f"download completed items={len(results)} files={file_count}")
-                    typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
-                except DownloadError as error:
-                    download_error = error
+                batch_kwargs = {
+                    "input_path": Path(source),
+                    "column": column,
+                    "output_dir": storage,
+                    "downloader": downloader,
+                    "download_concurrency": download_concurrency,
+                    "on_result": enqueue_upload,
+                    "raise_on_failure": False,
+                }
+                if transfer_cache is not None:
+                    batch_kwargs["before_download"] = transfer_cache.wait_for_space
+                download_results, download_failures = run_download_batch(**batch_kwargs)
+                file_count = sum(len(result.files) for result in download_results)
+                _verbose(verbose, f"download completed items={len(download_results)} files={file_count}")
+                typer.echo(f"downloaded {len(download_results)} item(s), {file_count} file(s)")
             else:
                 result = downloader.download(source, storage)
+                download_results.append(result)
                 enqueue_upload(result)
                 _verbose(verbose, f"download completed files={len(result.files)}")
                 typer.echo(f"downloaded {len(result.files)} file(s)")
 
-            uploaded = _collect_upload_futures(upload_futures)
-            if download_error is not None:
-                raise download_error
-            _verbose(verbose, f"upload completed files={len(uploaded)}")
-            typer.echo(f"uploaded {len(uploaded)} file(s)")
+            if csv_writer is not None:
+                for source, error in download_failures:
+                    csv_writer.writerow({
+                        "source": source,
+                        "status": "failed",
+                        "file": "",
+                        "s3_key": "",
+                        "error": str(error),
+                    })
+                csv_file.flush()
+
+            uploaded = 0
+            upload_errors: list[Exception] = []
+            for future in as_completed(upload_futures):
+                result = upload_futures[future]
+                try:
+                    s3_keys = future.result()
+                    status = "uploaded"
+                    error_str = ""
+                except Exception as error:
+                    upload_errors.append(error)
+                    s3_keys = []
+                    status = "failed"
+                    error_str = str(error)
+
+                uploaded += len(s3_keys)
+
+                if csv_writer is not None:
+                    if result.files:
+                        for i, file_path in enumerate(result.files):
+                            s3_key = s3_keys[i] if i < len(s3_keys) else ""
+                            csv_writer.writerow({
+                                "source": result.magnet,
+                                "status": status,
+                                "file": str(file_path),
+                                "s3_key": s3_key,
+                                "error": error_str,
+                            })
+                    else:
+                        csv_writer.writerow({
+                            "source": result.magnet,
+                            "status": status,
+                            "file": "",
+                            "s3_key": "",
+                            "error": error_str,
+                        })
+                    csv_file.flush()
+
+            _verbose(verbose, f"upload completed files={uploaded}")
+            typer.echo(f"uploaded {uploaded} file(s)")
+            if upload_errors:
+                details = "; ".join(str(error) for error in upload_errors)
+                raise UploadError(f"{len(upload_errors)} upload(s) failed: {details}")
+
+        if csv_file is not None:
+            csv_file.close()
     except (DownloadError, UploadConfigError, UploadError, tomllib.TOMLDecodeError, OSError) as error:
         _print_error(error)
         raise typer.Exit(1) from error
