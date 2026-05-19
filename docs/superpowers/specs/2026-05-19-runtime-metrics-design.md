@@ -46,7 +46,25 @@ Use a small SQLite database managed by `src/magnet_search/metrics.py`.
 - `bytes_per_second`
 - `eta_seconds`
 
-The schema stores a current snapshot rather than an event log. That keeps updates cheap and makes the monitor command simple. The latest run is selected by `updated_at` unless the user provides `--run-id`.
+`run_items` stores the latest per-item snapshot for commands that can expose individual item status, especially qBittorrent downloads:
+
+- `run_id`
+- `item_id`: stable source value or torrent hash when available.
+- `name`
+- `source`
+- `state`
+- `progress`
+- `size_bytes`
+- `downloaded_bytes`
+- `download_speed_bytes`
+- `upload_speed_bytes`
+- `eta_seconds`
+- `seeds`
+- `peers`
+- `save_path`
+- `updated_at`
+
+The schema stores current snapshots rather than an event log. That keeps updates cheap and makes the monitor command simple. The latest run is selected by `updated_at` unless the user provides `--run-id`.
 
 ## Runtime Updates
 
@@ -72,8 +90,10 @@ Upload:
 
 qBittorrent:
 
-- The existing polling loop updates stage, item progress, download speed, and ETA when a tracker is attached.
-- `qbittorrent-monitor` remains available for qBittorrent-specific torrent lists.
+- The existing polling loop updates stage, aggregate progress, aggregate download speed, and aggregate ETA when a tracker is attached.
+- Every qBittorrent poll also writes all visible downloads into `run_items`, including name, state, progress, size, downloaded bytes, speeds, ETA, seeds, peers, and save path.
+- Completed or removed torrents are deleted from `run_items` for a running qBittorrent-backed command after they disappear from the qBittorrent API snapshot.
+- `qbittorrent-monitor` remains available for direct qBittorrent inspection, but `magnet-search metrics` must show per-item qBittorrent status when the run wrote `run_items`.
 
 On normal completion, mark the run `completed` and set `finished_at`. On handled command errors, mark the run `failed` with the error message before exiting.
 
@@ -95,6 +115,7 @@ The terminal view uses Rich `Live` and displays:
 - Progress percentage and `completed/failed/skipped/total`.
 - Downloaded files, uploaded files.
 - Item speed, byte speed, ETA.
+- A per-item table when `run_items` exist, with name, state, progress, size, downloaded, download speed, upload speed, ETA, seeds, peers, and save path.
 - Last update time and last error.
 
 If the database or run is missing, the command exits cleanly with a clear error. If a running command stops updating, the view still shows the latest snapshot and last update timestamp.
@@ -113,9 +134,12 @@ Tests cover:
 
 - Metrics database initialization creates the expected tables.
 - `MetricsTracker` records run status, counters, rates, and ETA.
+- `MetricsTracker` records and replaces per-item snapshots in `run_items`.
 - Search/batch commands update metrics without changing stdout or existing CSV output.
 - Download batch updates total, completed, failed, files, bytes, and completion status.
+- qBittorrent-backed downloads write all visible download item states into `run_items`.
 - Upload updates uploaded file counters for cached and newly downloaded files.
 - `magnet-search metrics --once` renders a snapshot from SQLite.
+- `magnet-search metrics --once` renders qBittorrent per-item rows when present.
 - `magnet-search metrics --once --json` emits parseable JSON.
 - Commands without `--metrics-db` preserve existing behavior.
