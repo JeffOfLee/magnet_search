@@ -138,10 +138,8 @@ def _successful_record_inputs(records: list[DownloadRecord]) -> set[str]:
 
 
 def _source_is_skipped(source: str, skipped: set[str]) -> bool:
-    if source in skipped:
-        return True
     folded = source.casefold()
-    return any(token and token.casefold() in folded for token in skipped)
+    return any(token and token.casefold() == folded for token in skipped if token)
 
 
 def _result_input(result: DownloadResult) -> str:
