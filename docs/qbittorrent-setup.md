@@ -13,7 +13,9 @@ The `QbittorrentDownloader` communicates with a running qBittorrent instance thr
 
 For CSV downloads, startup recovery also inspects existing qBittorrent tasks. Existing `downloading` tasks are recorded to download metadata after they complete, and existing `stalledDL` tasks are recorded immediately so restarts do not add duplicate torrents.
 
-When `--engine qbittorrent` is used with a CSV batch, `magnet-search` submits all pending sources to qBittorrent in a paused state first. It then polls qBittorrent, sorts unfinished torrents by active seed count, and resumes only the top `--download-concurrency` torrents. Lower-seed unfinished torrents stay paused until a higher-priority active download completes or fails.
+When `--engine qbittorrent` is used with a CSV batch, `magnet-search` submits all pending sources to qBittorrent in a stopped/paused state first. It then polls qBittorrent, sorts unfinished torrents by active seed count, and starts or resumes only the top `--download-concurrency` torrents. Lower-seed unfinished torrents stay stopped/paused until a higher-priority active download completes or fails. The control calls support both newer `start`/`stop` Web API naming and older `resume`/`pause` naming.
+
+When `--upload` is also provided, completed qBittorrent items are passed to the upload scheduler immediately. Uploads do not wait for the full qBittorrent batch scheduler to finish.
 
 qBittorrent must be installed and running separately with Web UI enabled.
 

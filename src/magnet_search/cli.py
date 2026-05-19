@@ -527,24 +527,23 @@ def _run_qbittorrent_seed_priority_batch(
         result_path=download_meta,
         skip_sources=skip_sources,
     )
-    if on_statuses is None:
-        results, failures = downloader.download_sources_by_seed_priority(
-            sources,
-            storage,
-            max_active=download_concurrency,
-        )
-    else:
-        results, failures = downloader.download_sources_by_seed_priority(
-            sources,
-            storage,
-            max_active=download_concurrency,
-            on_statuses=on_statuses,
-        )
-    source_by_input = {source.input: source for source in sources}
-    for result in results:
+
+    def record_result(result: DownloadResult) -> None:
         append_download_record(download_meta, result, base_dir=storage)
         if on_result is not None:
             on_result(result)
+
+    batch_kwargs = {
+        "sources": sources,
+        "output_dir": storage,
+        "max_active": download_concurrency,
+        "on_result": record_result,
+    }
+    if on_statuses is not None:
+        batch_kwargs["on_statuses"] = on_statuses
+    results, failures = downloader.download_sources_by_seed_priority(**batch_kwargs)
+
+    source_by_input = {source.input: source for source in sources}
     for source_input, error in failures:
         source = source_by_input.get(source_input)
         append_download_record(

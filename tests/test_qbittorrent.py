@@ -136,10 +136,14 @@ def test_qbittorrent_adds_magnet_paused_when_requested(tmp_path: Path):
     add_call = mock_client.post.call_args_list[0]
     assert add_call[0][0].endswith("/api/v2/torrents/add")
     assert add_call[1]["data"]["paused"] == "true"
+    assert add_call[1]["data"]["stopped"] == "true"
     assert add_call[1]["data"]["savepath"] == str(tmp_path)
+    stop_call = mock_client.post.call_args_list[-1]
+    assert stop_call[0][0].endswith("/api/v2/torrents/stop")
+    assert stop_call[1]["data"] == {"hashes": "newhash"}
 
 
-def test_qbittorrent_pause_and_resume_hashes():
+def test_qbittorrent_stop_and_start_hashes():
     mock_client = MagicMock()
     mock_client.post.return_value = FakeResponse("Ok.")
     downloader = QbittorrentDownloader()
@@ -149,11 +153,31 @@ def test_qbittorrent_pause_and_resume_hashes():
     downloader.pause_hashes(["c"])
     downloader.resume_hashes([])
 
-    assert mock_client.post.call_args_list[0][0][0].endswith("/api/v2/torrents/resume")
+    assert mock_client.post.call_args_list[0][0][0].endswith("/api/v2/torrents/start")
     assert mock_client.post.call_args_list[0][1]["data"] == {"hashes": "a|b"}
-    assert mock_client.post.call_args_list[1][0][0].endswith("/api/v2/torrents/pause")
+    assert mock_client.post.call_args_list[1][0][0].endswith("/api/v2/torrents/stop")
     assert mock_client.post.call_args_list[1][1]["data"] == {"hashes": "c"}
     assert len(mock_client.post.call_args_list) == 2
+
+
+def test_qbittorrent_start_stop_falls_back_to_legacy_pause_resume():
+    mock_client = MagicMock()
+    mock_client.post.side_effect = [
+        FakeResponse("not found", status_code=404),
+        FakeResponse("Ok."),
+        FakeResponse("not found", status_code=404),
+        FakeResponse("Ok."),
+    ]
+    downloader = QbittorrentDownloader()
+    downloader._session = mock_client
+
+    downloader.resume_hashes(["a"])
+    downloader.pause_hashes(["b"])
+
+    assert mock_client.post.call_args_list[0][0][0].endswith("/api/v2/torrents/start")
+    assert mock_client.post.call_args_list[1][0][0].endswith("/api/v2/torrents/resume")
+    assert mock_client.post.call_args_list[2][0][0].endswith("/api/v2/torrents/stop")
+    assert mock_client.post.call_args_list[3][0][0].endswith("/api/v2/torrents/pause")
 
 
 def test_qbittorrent_rejects_empty_source(tmp_path: Path):
@@ -439,6 +463,7 @@ def test_qbittorrent_batch_resumes_top_n_by_active_seeds(tmp_path: Path):
     resume_calls: list[list[str]] = []
     pause_calls: list[list[str]] = []
     removed: list[str] = []
+    completed_inputs: list[str] = []
     downloader.resume_hashes = lambda hashes: resume_calls.append(list(hashes))
     downloader.pause_hashes = lambda hashes: pause_calls.append(list(hashes))
     downloader._remove_torrent = lambda info_hash: removed.append(info_hash)
@@ -484,6 +509,7 @@ def test_qbittorrent_batch_resumes_top_n_by_active_seeds(tmp_path: Path):
         ["one", "two", "three"],
         output_dir,
         max_active=2,
+        on_result=lambda result: completed_inputs.append(result.input),
     )
 
     assert failures == []
@@ -494,6 +520,7 @@ def test_qbittorrent_batch_resumes_top_n_by_active_seeds(tmp_path: Path):
     assert pause_calls[0] == ["h1"]
     assert resume_calls[1] == ["h1"]
     assert [result.input for result in results] == ["two", "three", "one"]
+    assert completed_inputs == ["two", "three", "one"]
     assert [path.name for result in results for path in result.files] == ["two.bin", "three.bin", "one.bin"]
     assert removed == ["h2", "h3", "h1"]
 

@@ -545,7 +545,7 @@ def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path
         def active_download_sources(self):
             return {"active"}
 
-        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
             captured["sources"] = [source.input for source in sources]
             return [], []
 
@@ -586,7 +586,7 @@ def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_p
                 )
             ]
 
-        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
             captured["sources"] = [source.input for source in sources]
             return [], []
 
@@ -636,14 +636,18 @@ def test_download_command_routes_qbittorrent_batch_to_seed_priority_scheduler(mo
         def active_download_sources(self):
             return set()
 
-        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
             captured["sources"] = sources
             captured["output_dir"] = output_dir
             captured["max_active"] = max_active
-            return [
+            results = [
                 cli.DownloadResult(magnet=source.source, files=[output_dir / f"{source.input}.bin"], input=source.input)
                 for source in sources
-            ], []
+            ]
+            if on_result is not None:
+                for result in results:
+                    on_result(result)
+            return results, []
 
     monkeypatch.setattr(cli, "QbittorrentDownloader", SeedPriorityDownloader)
     monkeypatch.setattr(
@@ -689,7 +693,7 @@ def test_download_command_records_qbittorrent_item_metrics(monkeypatch, tmp_path
         def active_download_sources(self):
             return set()
 
-        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_statuses=None):
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None, on_statuses=None):
             if on_statuses is not None:
                 on_statuses(
                     [
@@ -759,14 +763,18 @@ def test_download_command_uploads_qbittorrent_seed_priority_batch_results(monkey
         def active_download_sources(self):
             return set()
 
-        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
             first_file.parent.mkdir(parents=True, exist_ok=True)
             first_file.write_text("payload", encoding="utf-8")
             second_file.write_text("payload", encoding="utf-8")
-            return [
+            results = [
                 cli.DownloadResult(magnet="first", files=[first_file], input="first"),
                 cli.DownloadResult(magnet="second", files=[second_file], input="second"),
-            ], []
+            ]
+            if on_result is not None:
+                for result in results:
+                    on_result(result)
+            return results, []
 
     monkeypatch.setattr(cli, "QbittorrentDownloader", SeedPriorityDownloader)
     monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
@@ -789,6 +797,66 @@ def test_download_command_uploads_qbittorrent_seed_priority_batch_results(monkey
     assert uploader.calls == [([first_file], storage_path), ([second_file], storage_path)]
     assert "downloaded 2 item(s), 2 file(s)" in result.stdout
     assert "uploaded 2 file(s)" in result.stdout
+
+
+def test_download_command_starts_qbittorrent_upload_before_scheduler_returns(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\nsecond\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    first_file = storage_path / "first.mp4"
+    second_file = storage_path / "second.mp4"
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploader = FakeUploader()
+    observed = {"uploaded_before_scheduler_return": False}
+
+    class SeedPriorityDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def startup_download_results(self, storage):
+            return []
+
+        def active_download_sources(self):
+            return set()
+
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active, on_result=None):
+            assert on_result is not None
+            first_file.parent.mkdir(parents=True, exist_ok=True)
+            first_file.write_text("payload", encoding="utf-8")
+            first = cli.DownloadResult(magnet="first", files=[first_file], input="first")
+            on_result(first)
+
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and not uploader.calls:
+                time.sleep(0.01)
+            observed["uploaded_before_scheduler_return"] = bool(uploader.calls)
+
+            second_file.write_text("payload", encoding="utf-8")
+            second = cli.DownloadResult(magnet="second", files=[second_file], input="second")
+            on_result(second)
+            return [first, second], []
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", SeedPriorityDownloader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--engine",
+            "qbittorrent",
+            "--upload",
+            str(upload_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert observed["uploaded_before_scheduler_return"] is True
+    assert uploader.calls == [([first_file], storage_path), ([second_file], storage_path)]
 
 
 def test_qbittorrent_monitor_renders_current_downloads_once(monkeypatch):

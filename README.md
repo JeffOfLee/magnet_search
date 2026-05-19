@@ -102,7 +102,7 @@ If the first argument points to an existing `.csv` file, the command treats it a
 
 For `download`, `--storage` is the local download/cache directory. `--download-meta` writes a real-time CSV result log and defaults to `{storage}/.download_meta.csv`. The legacy `--output` alias still maps to `--download-meta`.
 
-To upload downloaded files to S3 after the local download completes, pass an upload config file:
+To upload downloaded files to S3, pass an upload config file. For CSV batches, each completed download is handed to the upload scheduler immediately while other downloads continue:
 
 ```bash
 magnet-search download input.csv --storage downloads/ --upload s3-upload.toml
@@ -111,7 +111,7 @@ magnet-search download downloads/.download_meta.csv --storage downloads/ --uploa
 magnet-search download input.csv --storage downloads/ --upload s3-upload.toml --transfer-cache-storage 10GB
 ```
 
-`--download-concurrency` controls how many CSV batch rows can download at the same time for the default `aria2c` engine. For `--engine qbittorrent`, CSV batch tasks are all submitted to qBittorrent paused first, then the unfinished torrents with the most active seeds are resumed up to `--download-concurrency`. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Both default to `1`.
+`--download-concurrency` controls how many CSV batch rows can download at the same time for the default `aria2c` engine. For `--engine qbittorrent`, CSV batch tasks are all submitted to qBittorrent paused first, then the unfinished torrents with the most active seeds are resumed up to `--download-concurrency`. `--upload-concurrency` controls how many S3 upload tasks can run at the same time when `--upload` is provided. Download and upload have independent schedulers, connected by per-item completion events. Both default to `1`.
 
 When `--upload` is provided, upload progress is written to `--upload-meta`, defaulting to `{storage}/.upload_meta.csv`. If the input CSV is a download metadata file, the command uploads the already-downloaded files from that metadata instead of downloading again.
 

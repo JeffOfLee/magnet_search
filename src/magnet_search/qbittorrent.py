@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from magnet_search.download import DownloadError, DownloadResult, _snapshot_files, _changed_files
+from magnet_search.download import DownloadError, DownloadResult, ResultCallback, _snapshot_files, _changed_files
 
 
 @dataclass(frozen=True)
@@ -131,24 +131,33 @@ class QbittorrentDownloader:
         return response
 
     def add_paused(self, source: str, output_dir: Path) -> str:
-        return self._add_source(source, output_dir, paused=True)
+        info_hash = self._add_source(source, output_dir, paused=True)
+        self.pause_hashes([info_hash])
+        return info_hash
 
     def resume_hashes(self, hashes: list[str]) -> None:
-        self._set_hashes_state("/api/v2/torrents/resume", hashes)
+        self._set_hashes_state("/api/v2/torrents/start", hashes, fallback_endpoint="/api/v2/torrents/resume")
 
     def pause_hashes(self, hashes: list[str]) -> None:
-        self._set_hashes_state("/api/v2/torrents/pause", hashes)
+        self._set_hashes_state("/api/v2/torrents/stop", hashes, fallback_endpoint="/api/v2/torrents/pause")
 
-    def _set_hashes_state(self, endpoint: str, hashes: list[str]) -> None:
+    def _set_hashes_state(self, endpoint: str, hashes: list[str], fallback_endpoint: str | None = None) -> None:
         if not hashes:
             return
-        self._api_post(endpoint, data={"hashes": "|".join(hashes)})
+        data = {"hashes": "|".join(hashes)}
+        try:
+            self._api_post(endpoint, data=data)
+        except httpx.HTTPStatusError as error:
+            if fallback_endpoint is None or error.response.status_code not in (404, 405):
+                raise
+            self._api_post(fallback_endpoint, data=data)
 
     def download_sources_by_seed_priority(
         self,
         sources: list[object],
         output_dir: Path,
         max_active: int,
+        on_result: ResultCallback | None = None,
         on_statuses=None,
     ) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
         if max_active < 1:
@@ -200,7 +209,10 @@ class QbittorrentDownloader:
                     continue
 
                 if progress >= 1.0:
-                    results.append(self._download_result_from_source_torrent(source, torrent, output_dir))
+                    result = self._download_result_from_source_torrent(source, torrent, output_dir)
+                    results.append(result)
+                    if on_result is not None:
+                        on_result(result)
                     self._remove_torrent(info_hash)
                     del tracked[info_hash]
                     no_seed_counts.pop(info_hash, None)
@@ -299,6 +311,7 @@ class QbittorrentDownloader:
         data = {"savepath": str(output_dir)}
         if paused:
             data["paused"] = "true"
+            data["stopped"] = "true"
         if source_path.suffix.lower() == ".torrent" and source_path.exists():
             self._log(f"adding torrent file: {source_path.name} ({source_path.stat().st_size / 1024:.0f} KB)")
             torrent_data = source_path.read_bytes()
