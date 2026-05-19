@@ -888,6 +888,52 @@ def test_qbittorrent_monitor_renders_all_current_downloads_once(monkeypatch):
     assert "100.0%" in result.stdout
 
 
+def test_qbittorrent_monitor_filters_by_state_once(monkeypatch):
+    class MonitoringDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def list_downloads(self):
+            return [
+                QbittorrentDownloadStatus(
+                    name="Ubuntu ISO",
+                    state="downloading",
+                    progress=0.5,
+                    size=2_000_000,
+                    downloaded=1_000_000,
+                    download_speed=500_000,
+                    upload_speed=10_000,
+                    eta=60,
+                    seeds=7,
+                    peers=3,
+                    save_path="/downloads/linux",
+                ),
+                QbittorrentDownloadStatus(
+                    name="Archive Pack",
+                    state="stalledDL",
+                    progress=0.25,
+                    size=4_000_000,
+                    downloaded=1_000_000,
+                    download_speed=0,
+                    upload_speed=0,
+                    eta=0,
+                    seeds=0,
+                    peers=1,
+                    save_path="/downloads/archive",
+                ),
+            ]
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", MonitoringDownloader)
+
+    result = runner.invoke(cli.app, ["qbittorrent-monitor", "--once", "--state", "downloading"])
+
+    assert result.exit_code == 0
+    assert "Ubuntu ISO" in result.stdout
+    assert "downloading" in result.stdout
+    assert "Archive Pack" not in result.stdout
+    assert "stalledDL" not in result.stdout
+
+
 def test_metrics_command_renders_json_snapshot(tmp_path):
     metrics_db = tmp_path / "metrics.sqlite"
     tracker = MetricsTracker(metrics_db, "download", run_id="run-1")

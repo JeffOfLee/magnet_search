@@ -96,7 +96,7 @@ magnet-search qbittorrent-monitor \
   --qbittorrent-password adminadmin
 ```
 
-`qbittorrent-monitor` refreshes the current torrent list and status every 1 second by default. Use `--interval` to change the refresh period.
+`qbittorrent-monitor` refreshes the current torrent list and status every 1 second by default. Use `--interval` to change the refresh period. By default it shows all states; pass `--state downloading` to show only one state, or repeat `--state` for multiple states.
 
 If the first argument points to an existing `.csv` file, the command treats it as a batch input. The CSV column defaults to `magnet`; when the input is a search metadata file, the command automatically uses `result`. Use `--column` to override it. CSV values can be magnet links or `.torrent` file paths. Relative `.torrent` paths in CSV rows are resolved relative to the CSV file's directory.
 

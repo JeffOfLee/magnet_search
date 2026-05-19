@@ -303,6 +303,16 @@ def _render_qbittorrent_monitor_table(downloads: list[QbittorrentDownloadStatus]
     return table
 
 
+def _filter_qbittorrent_downloads(
+    downloads: list[QbittorrentDownloadStatus],
+    states: list[str] | None,
+) -> list[QbittorrentDownloadStatus]:
+    if not states:
+        return downloads
+    allowed = {state.casefold() for state in states}
+    return [download for download in downloads if download.state.casefold() in allowed]
+
+
 def _is_csv_batch_source(source: str) -> bool:
     path = Path(source)
     return path.exists() and path.suffix.lower() == ".csv"
@@ -696,6 +706,11 @@ def qbittorrent_monitor(
     qbittorrent_username: str = typer.Option("admin", help="qBittorrent Web API username."),
     qbittorrent_password: str = typer.Option("", help="qBittorrent Web API password."),
     interval: float = typer.Option(1.0, "--interval", min=0.1, help="Refresh interval in seconds."),
+    states: list[str] | None = typer.Option(
+        None,
+        "--state",
+        help="Only show torrents in this qBittorrent state. Repeat for multiple states. Defaults to all states.",
+    ),
     once: bool = typer.Option(False, "--once", hidden=True, help="Render once and exit."),
 ) -> None:
     downloader = QbittorrentDownloader(
@@ -706,12 +721,12 @@ def qbittorrent_monitor(
 
     try:
         if once:
-            console.print(_render_qbittorrent_monitor_table(downloader.list_downloads()))
+            console.print(_render_qbittorrent_monitor_table(_filter_qbittorrent_downloads(downloader.list_downloads(), states)))
             return
 
         with Live(console=console, refresh_per_second=4, transient=False) as live:
             while True:
-                live.update(_render_qbittorrent_monitor_table(downloader.list_downloads()))
+                live.update(_render_qbittorrent_monitor_table(_filter_qbittorrent_downloads(downloader.list_downloads(), states)))
                 time.sleep(interval)
     except KeyboardInterrupt:
         return
