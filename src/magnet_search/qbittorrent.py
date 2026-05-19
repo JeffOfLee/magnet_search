@@ -180,7 +180,9 @@ class QbittorrentDownloader:
                 progress = _float_value(existing_torrent.get("progress"))
 
                 if state == "stalledDL":
-                    failures.append((source.input, DownloadError("qBittorrent torrent state is stalledDL")))
+                    if info_hash:
+                        tracked[info_hash] = source
+                        no_seed_counts[info_hash] = 0
                     continue
                 if state in ("error", "missingFiles"):
                     failures.append((source.input, DownloadError(f"qBittorrent torrent error state: {state}")))
@@ -232,13 +234,11 @@ class QbittorrentDownloader:
 
                 state = str(torrent.get("state", ""))
                 progress = _float_value(torrent.get("progress"))
-                if state == "stalledDL":
-                    failures.append((source.input, DownloadError("qBittorrent torrent state is stalledDL")))
-                    del tracked[info_hash]
-                    no_seed_counts.pop(info_hash, None)
-                    continue
-
-                if state in ("error", "missingFiles"):
+                if state in ("pausedDL", "pausedUP"):
+                    pass
+                elif state == "stalledDL":
+                    pass
+                elif state in ("error", "missingFiles"):
                     failures.append((source.input, DownloadError(f"qBittorrent torrent error state: {state}")))
                     self._remove_torrent(info_hash)
                     del tracked[info_hash]
@@ -264,7 +264,9 @@ class QbittorrentDownloader:
                     no_seed_counts[new_hash] = 0
                     continue
 
-                if self._has_no_active_seeds(torrent):
+                if state in ("pausedDL", "pausedUP"):
+                    pass
+                elif self._has_no_active_seeds(torrent):
                     no_seed_counts[info_hash] = no_seed_counts.get(info_hash, 0) + 1
                     if no_seed_counts[info_hash] >= self.no_seed_checks:
                         failures.append((source.input, DownloadError("qBittorrent torrent has no active seeds")))

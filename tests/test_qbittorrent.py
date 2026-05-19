@@ -662,20 +662,30 @@ def test_qbittorrent_batch_fails_existing_stalled_record_without_readding(tmp_pa
     output_dir = tmp_path / "downloads"
     output_dir.mkdir()
     source = "magnet:?xt=urn:btih:stalledhash"
-    torrent = _make_torrent("stalledhash", "stalledDL", 0.2, name="stalled", magnet_uri=source)
-    downloader = QbittorrentDownloader(poll_interval=0.01)
+    downloader = QbittorrentDownloader(poll_interval=0.01, no_seed_checks=1)
     downloader.add_paused = MagicMock(return_value="newhash")
-    downloader._remove_torrent = MagicMock()
-    downloader._api_get = lambda endpoint, params=None: FakeResponse(json_data=[torrent])
+    removed: list[str] = []
+    downloader.resume_hashes = lambda hashes: None
+    downloader.pause_hashes = lambda hashes: None
+    downloader._remove_torrent = lambda info_hash: removed.append(info_hash)
+    snapshots = [
+        [
+            _make_torrent("stalledhash", "stalledDL", 0.2, name="stalled", magnet_uri=source, num_seeds=0),
+        ],
+        [
+            _make_torrent("stalledhash", "stalledDL", 0.2, name="stalled", magnet_uri=source, num_seeds=0),
+        ],
+    ]
+    downloader._api_get = lambda endpoint, params=None: FakeResponse(json_data=snapshots.pop(0) if snapshots else [])
 
     results, failures = downloader.download_sources_by_seed_priority([source], output_dir, max_active=1)
 
     assert results == []
     assert len(failures) == 1
     assert failures[0][0] == source
-    assert "stalledDL" in str(failures[0][1])
+    assert "no active seeds" in str(failures[0][1])
     downloader.add_paused.assert_not_called()
-    downloader._remove_torrent.assert_not_called()
+    assert removed == ["stalledhash"]
 
 
 def test_qbittorrent_seed_priority_batch_fails_torrent_with_no_active_seeds(tmp_path: Path):
@@ -688,8 +698,8 @@ def test_qbittorrent_seed_priority_batch_fails_torrent_with_no_active_seeds(tmp_
     downloader.pause_hashes = lambda hashes: None
     downloader._remove_torrent = lambda info_hash: removed.append(info_hash)
     snapshots = [
-        [_make_torrent("h1", "pausedDL", 0.0, name="one", num_seeds=0)],
-        [_make_torrent("h1", "pausedDL", 0.0, name="one", num_seeds=0)],
+        [_make_torrent("h1", "stalledDL", 0.0, name="one", num_seeds=0)],
+        [_make_torrent("h1", "stalledDL", 0.0, name="one", num_seeds=0)],
     ]
     def mock_get(endpoint, params=None):
         if params:
