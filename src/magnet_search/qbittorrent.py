@@ -194,6 +194,70 @@ class QbittorrentDownloader:
         except Exception:
             return set()
 
+    def startup_download_results(self, output_dir: Path) -> list[DownloadResult]:
+        active_states = frozenset(("downloading", "forcedDL", "queuedDL", "metaDL", "checkingDL"))
+        immediate_states = frozenset(("stalledDL",))
+        response = self._api_get("/api/v2/torrents/info")
+        results: list[DownloadResult] = []
+
+        for torrent in response.json():
+            state = torrent.get("state")
+            if state not in active_states and state not in immediate_states:
+                continue
+
+            info_hash = str(torrent.get("hash", ""))
+            if state in active_states:
+                if not info_hash:
+                    continue
+                self._wait_for_completion(info_hash)
+                self._remove_torrent(info_hash)
+
+            results.append(self._download_result_from_torrent(torrent, output_dir))
+
+        return results
+
+    def _download_result_from_torrent(self, torrent: dict, output_dir: Path) -> DownloadResult:
+        source = self._torrent_source(torrent)
+        return DownloadResult(
+            magnet=source,
+            files=self._torrent_files(torrent, output_dir),
+            input=source,
+        )
+
+    def _torrent_source(self, torrent: dict) -> str:
+        for key in ("magnet_uri", "hash", "name"):
+            value = torrent.get(key)
+            if value:
+                return str(value)
+        return ""
+
+    def _torrent_files(self, torrent: dict, output_dir: Path) -> list[Path]:
+        candidates: list[Path] = []
+        for key in ("content_path",):
+            value = torrent.get(key)
+            if value:
+                candidates.append(Path(str(value)))
+
+        save_path = torrent.get("save_path")
+        name = torrent.get("name")
+        if save_path and name:
+            candidates.append(Path(str(save_path)) / str(name))
+        if name:
+            candidates.append(output_dir / str(name))
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            if not candidate.is_absolute():
+                candidate = output_dir / candidate
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.is_file():
+                return [candidate]
+            if candidate.is_dir():
+                return sorted((path for path in candidate.rglob("*") if path.is_file()), key=lambda path: str(path))
+        return []
+
     def _find_new_hash(self, existing_hashes: set[str]) -> str | None:
         for _ in range(10):
             time.sleep(1)

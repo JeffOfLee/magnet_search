@@ -26,8 +26,10 @@ class FakeResponse:
             raise HTTPStatusError("", request=MagicMock(), response=self)
 
 
-def _make_torrent(info_hash, state="downloading", progress=0.0, name="test"):
-    return {"hash": info_hash, "state": state, "progress": progress, "name": name}
+def _make_torrent(info_hash, state="downloading", progress=0.0, name="test", **kwargs):
+    torrent = {"hash": info_hash, "state": state, "progress": progress, "name": name}
+    torrent.update(kwargs)
+    return torrent
 
 
 def test_qbittorrent_login_success():
@@ -295,3 +297,65 @@ def test_qbittorrent_removes_torrent_when_no_active_seeds(tmp_path: Path):
     ]
     assert delete_calls
     assert delete_calls[-1][1]["data"] == {"hashes": "newhash", "deleteFiles": "false"}
+
+
+def test_qbittorrent_startup_results_wait_for_downloading_torrent(tmp_path: Path):
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir()
+    file_path = output_dir / "movie.mkv"
+    file_path.write_text("video content", encoding="utf-8")
+
+    mock_client = MagicMock()
+    mock_client.post.return_value = FakeResponse("Ok.")
+    torrent = _make_torrent(
+        "activehash",
+        "downloading",
+        0.4,
+        magnet_uri="magnet:?xt=urn:btih:active",
+        content_path=str(file_path),
+    )
+
+    def mock_get(endpoint, params=None):
+        if params and params.get("hashes") == "activehash":
+            return FakeResponse(json_data=[_make_torrent("activehash", "pausedUP", 1.0)])
+        return FakeResponse(json_data=[torrent])
+
+    mock_client.get.side_effect = mock_get
+    downloader = QbittorrentDownloader(poll_interval=0.01)
+    downloader._session = mock_client
+
+    results = downloader.startup_download_results(output_dir)
+
+    assert len(results) == 1
+    assert results[0].magnet == "magnet:?xt=urn:btih:active"
+    assert results[0].input == "magnet:?xt=urn:btih:active"
+    assert results[0].files == [file_path]
+
+
+def test_qbittorrent_startup_results_record_stalled_torrent_without_waiting(tmp_path: Path):
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir()
+    file_path = output_dir / "stalled.mkv"
+    file_path.write_text("video content", encoding="utf-8")
+
+    mock_client = MagicMock()
+    mock_client.post.return_value = FakeResponse("Ok.")
+    mock_client.get.return_value = FakeResponse(json_data=[
+        _make_torrent(
+            "stalledhash",
+            "stalledDL",
+            0.3,
+            magnet_uri="magnet:?xt=urn:btih:stalled",
+            content_path=str(file_path),
+        )
+    ])
+    downloader = QbittorrentDownloader(poll_interval=0.01)
+    downloader._session = mock_client
+
+    results = downloader.startup_download_results(output_dir)
+
+    assert results[0].magnet == "magnet:?xt=urn:btih:stalled"
+    assert results[0].input == "magnet:?xt=urn:btih:stalled"
+    assert results[0].files == [file_path]
+    hash_wait_calls = [call for call in mock_client.get.call_args_list if call.kwargs.get("params")]
+    assert hash_wait_calls == []

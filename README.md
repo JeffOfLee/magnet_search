@@ -118,7 +118,7 @@ When `--upload` is provided, upload progress is written to `--upload-meta`, defa
 The search, download, and upload stages can be restarted after interruption:
 
 - Search reads the existing search metadata and skips keywords that already have `status=success`.
-- Download reads the existing download metadata, skips inputs that already have `status=success`, removes failed-record residue under `--storage`, and for qBittorrent also skips active `downloading`/`stalledDL` tasks reported by the Web API.
+- Download reads the existing download metadata, skips inputs that already have `status=success`, removes failed-record residue under `--storage`, and for qBittorrent records startup `stalledDL` tasks immediately while waiting for startup `downloading` tasks to finish before writing them to download metadata.
 - Upload reads the upload metadata and cache directory, deletes cache files already marked successful, and enqueues successful download records that still exist locally but do not yet have successful upload rows.
 
 Add `--verbose` to print detailed process logs to stderr. Normal stdout remains unchanged, so JSON output and CSV file outputs stay parseable.

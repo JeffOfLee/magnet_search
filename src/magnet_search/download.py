@@ -212,11 +212,12 @@ def append_download_record(
     failure: tuple[str, Exception] | None = None,
     failure_keyword: str = "",
     failure_origin: str = "",
+    base_dir: Path | None = None,
 ) -> None:
     record_path = _download_meta_path(output_dir)
     record_path.parent.mkdir(parents=True, exist_ok=True)
-    base_dir = output_dir if output_dir.suffix.lower() != ".csv" else record_path.parent
-    rows = _download_rows(base_dir, result, failure, failure_keyword, failure_origin)
+    rows_base_dir = base_dir or (output_dir if output_dir.suffix.lower() != ".csv" else record_path.parent)
+    rows = _download_rows(rows_base_dir, result, failure, failure_keyword, failure_origin)
 
     if not rows:
         return

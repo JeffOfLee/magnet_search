@@ -11,6 +11,8 @@ The `QbittorrentDownloader` communicates with a running qBittorrent instance thr
 3. Polls download progress until completion
 4. Cleans up the torrent entry (keeping downloaded files)
 
+For CSV downloads, startup recovery also inspects existing qBittorrent tasks. Existing `downloading` tasks are recorded to download metadata after they complete, and existing `stalledDL` tasks are recorded immediately so restarts do not add duplicate torrents.
+
 qBittorrent must be installed and running separately with Web UI enabled.
 
 ## Prerequisites
@@ -18,7 +20,7 @@ qBittorrent must be installed and running separately with Web UI enabled.
 | Platform | Required Package | Notes |
 |----------|-----------------|-------|
 | Linux | `qbittorrent-nox` | Headless binary with built-in Web UI |
-| macOS | `qbittorrent-nox` (via Docker or source build) | The native `qBittorrent.app` does **not** include Web UI support |
+| macOS | `qBittorrent.app` or Docker | The prebuilt macOS app can enable Web UI from Preferences |
 | Windows | `qbittorrent` installer | GUI version includes Web UI; run with `--no-splash` |
 | Docker | `linuxserver/qbittorrent` | Recommended for headless deployments |
 
@@ -87,9 +89,44 @@ WantedBy=multi-user.target
 
 ## macOS
 
-The native `qBittorrent.app` (installed via `brew install qbittorrent` or the `.dmg`) does **not** include the Web UI module. Options:
+The prebuilt macOS `qBittorrent.app` can be used as the `magnet-search` qBittorrent download backend as long as the app is running and Web UI is enabled. This is the simplest local setup when you install qBittorrent from the official `.dmg` or a package manager that installs the GUI app.
 
-### Docker (Recommended)
+### Prebuilt macOS App
+
+1. Install qBittorrent:
+
+   ```bash
+   brew install --cask qbittorrent
+   ```
+
+   Or download the macOS package from the official qBittorrent website.
+
+2. Open `qBittorrent.app`.
+
+3. Enable the Web UI:
+   - Open `qBittorrent > Preferences...`
+   - Go to `Web UI`
+   - Check `Web User Interface (Remote control)`
+   - Set `IP address` to `127.0.0.1` or leave the default if you only use it locally
+   - Set `Port` to `8080`
+   - Set a username and password
+
+4. Keep `qBittorrent.app` running while using `magnet-search`.
+
+5. Point `magnet-search` at the Web UI:
+
+   ```bash
+   magnet-search download movie.torrent --storage downloads/ --engine qbittorrent \
+     --qbittorrent-url http://127.0.0.1:8080 \
+     --qbittorrent-username admin \
+     --qbittorrent-password '<your-web-ui-password>'
+   ```
+
+The Web UI endpoint is the control plane used by `magnet-search`; downloaded files are still saved by qBittorrent to the `--storage` path passed when each torrent is added.
+
+### Docker
+
+Use Docker when you want a headless service instead of keeping the GUI app open:
 
 ```bash
 docker run -d \

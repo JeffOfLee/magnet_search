@@ -264,6 +264,38 @@ def _active_download_sources(downloader: object) -> set[str]:
         return set()
 
 
+def _download_result_input(result: DownloadResult) -> str:
+    return result.input or result.magnet
+
+
+def _startup_download_results(downloader: object, storage: Path) -> list[DownloadResult]:
+    getter = getattr(downloader, "startup_download_results", None)
+    if getter is None:
+        return []
+    return list(getter(storage))
+
+
+def _record_startup_download_results(
+    results: list[DownloadResult],
+    storage: Path,
+    download_meta: Path,
+) -> list[DownloadResult]:
+    existing_inputs = {
+        record.input
+        for record in load_download_records(download_meta)
+        if record.status == "success" and record.input
+    }
+    recorded: list[DownloadResult] = []
+    for result in results:
+        result_input = _download_result_input(result)
+        if result_input in existing_inputs:
+            continue
+        append_download_record(download_meta, result, base_dir=storage)
+        existing_inputs.add(result_input)
+        recorded.append(result)
+    return recorded
+
+
 def _collect_upload_futures(upload_futures: list[Future[list[str]]]) -> list[str]:
     uploaded: list[str] = []
     failures: list[Exception] = []
@@ -446,6 +478,18 @@ def download(
             ),
         )
 
+        startup_results: list[DownloadResult] = []
+        startup_sources: set[str] = set()
+        if is_batch and not is_download_meta:
+            startup_results = _record_startup_download_results(
+                _startup_download_results(downloader, storage),
+                storage,
+                resolved_download_meta,
+            )
+            startup_sources = {_download_result_input(result) for result in startup_results}
+            if startup_results:
+                _verbose(verbose, f"download recovered startup items={len(startup_results)}")
+
         if uploader is None:
             if is_batch:
                 batch_kwargs = {
@@ -456,13 +500,14 @@ def download(
                     "download_concurrency": download_concurrency,
                     "result_path": resolved_download_meta,
                 }
-                active_sources = _active_download_sources(downloader)
+                active_sources = _active_download_sources(downloader) | startup_sources
                 if active_sources:
                     batch_kwargs["skip_sources"] = active_sources
                 results, _ = run_download_batch(**batch_kwargs)
-                file_count = sum(len(result.files) for result in results)
-                _verbose(verbose, f"download completed items={len(results)} files={file_count}")
-                typer.echo(f"downloaded {len(results)} item(s), {file_count} file(s)")
+                all_results = startup_results + results
+                file_count = sum(len(result.files) for result in all_results)
+                _verbose(verbose, f"download completed items={len(all_results)} files={file_count}")
+                typer.echo(f"downloaded {len(all_results)} item(s), {file_count} file(s)")
             else:
                 result = downloader.download(source, storage)
                 append_download_record(storage, DownloadResult(result.magnet, result.files, input=source))
@@ -566,6 +611,8 @@ def download(
                 active_sources = _active_download_sources(downloader)
                 if active_sources:
                     batch_kwargs["skip_sources"] = set(batch_kwargs.get("skip_sources", set())) | active_sources
+                if startup_sources:
+                    batch_kwargs["skip_sources"] = set(batch_kwargs.get("skip_sources", set())) | startup_sources
                 if transfer_cache is not None:
                     batch_kwargs["before_download"] = transfer_cache.wait_for_space
                 download_results, download_failures = run_download_batch(**batch_kwargs)

@@ -493,6 +493,61 @@ def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path
     assert captured["skip_sources"] == {"active"}
 
 
+def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_path):
+    captured = {}
+    input_path = tmp_path / "input.csv"
+    storage_path = tmp_path / "downloads"
+    file_path = storage_path / "recovered.mp4"
+    input_path.write_text("magnet\nmagnet:?xt=urn:btih:recovered\nfresh\n", encoding="utf-8")
+    file_path.parent.mkdir()
+    file_path.write_text("video content", encoding="utf-8")
+
+    class RecoveringDownloader(FakeDownloader):
+        def startup_download_results(self, output_dir):
+            return [
+                cli.DownloadResult(
+                    magnet="magnet:?xt=urn:btih:recovered",
+                    files=[file_path],
+                    input="magnet:?xt=urn:btih:recovered",
+                )
+            ]
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", lambda **kwargs: RecoveringDownloader())
+
+    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, **kwargs):
+        captured["skip_sources"] = kwargs.get("skip_sources")
+        return [], []
+
+    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--engine",
+            "qbittorrent",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["skip_sources"] == {"magnet:?xt=urn:btih:recovered"}
+    rows = list(csv.DictReader((storage_path / DOWNLOAD_RECORD_FILENAME).open(encoding="utf-8")))
+    assert rows == [
+        {
+            "keyword": "",
+            "origin": "",
+            "input": "magnet:?xt=urn:btih:recovered",
+            "item": "recovered.mp4",
+            "path": str(file_path),
+            "status": "success",
+            "err": "",
+        }
+    ]
+
+
 def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch, tmp_path):
     input_path = tmp_path / "input.csv"
     input_path.write_text("magnet\nfirst\nsecond\nthird\nfourth\n", encoding="utf-8")
