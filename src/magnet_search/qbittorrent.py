@@ -136,6 +136,9 @@ class QbittorrentDownloader:
         self.pause_hashes([info_hash])
         return info_hash
 
+    def add_active(self, source: str, output_dir: Path) -> str:
+        return self._add_source(source, output_dir, paused=False)
+
     def resume_hashes(self, hashes: list[str]) -> None:
         self._set_hashes_state("/api/v2/torrents/start", hashes, fallback_endpoint="/api/v2/torrents/resume")
 
@@ -205,7 +208,7 @@ class QbittorrentDownloader:
                     continue
 
             try:
-                info_hash = self.add_paused(source.source, output_dir)
+                info_hash = self.add_active(source.source, output_dir)
             except Exception as error:
                 failures.append((source.input, error))
                 continue
@@ -256,7 +259,7 @@ class QbittorrentDownloader:
                         continue
                     self._remove_torrent(info_hash)
                     try:
-                        new_hash = self.add_paused(source.source, output_dir)
+                        new_hash = self.add_active(source.source, output_dir)
                     except Exception as error:
                         failures.append((source.input, error))
                         continue
@@ -279,21 +282,6 @@ class QbittorrentDownloader:
             if not tracked:
                 break
 
-            unfinished = [
-                (info_hash, torrents_by_hash[info_hash])
-                for info_hash in tracked
-                if info_hash in torrents_by_hash
-            ]
-            unfinished.sort(
-                key=lambda item: (
-                    -_int_value(item[1].get("num_seeds")),
-                    tracked[item[0]].index,
-                )
-            )
-            active_hashes = [info_hash for info_hash, _ in unfinished[:max_active]]
-            paused_hashes = [info_hash for info_hash, _ in unfinished[max_active:]]
-            self.resume_hashes(active_hashes)
-            self.pause_hashes(paused_hashes)
             time.sleep(self.poll_interval)
 
         return results, failures

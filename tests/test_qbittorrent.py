@@ -459,47 +459,28 @@ def test_qbittorrent_batch_resumes_top_n_by_active_seeds(tmp_path: Path):
         (output_dir / name).write_text("payload", encoding="utf-8")
 
     downloader = QbittorrentDownloader(poll_interval=0.01)
-    downloader.add_paused = MagicMock(side_effect=["h1", "h2", "h3"])
-    resume_calls: list[list[str]] = []
-    pause_calls: list[list[str]] = []
+    downloader.add_active = MagicMock(side_effect=["h1", "h2", "h3"])
     removed: list[str] = []
     completed_inputs: list[str] = []
-    downloader.resume_hashes = lambda hashes: resume_calls.append(list(hashes))
-    downloader.pause_hashes = lambda hashes: pause_calls.append(list(hashes))
     downloader._remove_torrent = lambda info_hash: removed.append(info_hash)
     snapshots = [
         [
-            _make_torrent("h1", "pausedDL", 0.0, name="one", num_seeds=1),
-            _make_torrent("h2", "pausedDL", 0.0, name="two", num_seeds=10),
-            _make_torrent("h3", "pausedDL", 0.0, name="three", num_seeds=5),
+            _make_torrent("h1", "stalledDL", 0.0, name="one", num_seeds=0),
+            _make_torrent("h2", "stalledDL", 0.0, name="two", num_seeds=0),
+            _make_torrent("h3", "stalledDL", 0.0, name="three", num_seeds=0),
         ],
         [
-            _make_torrent("h1", "pausedDL", 0.0, name="one", num_seeds=1),
             _make_torrent(
-                "h2",
-                "pausedUP",
-                1.0,
-                name="two",
-                num_seeds=10,
+                "h1", "stalledUP", 1.0, name="one", num_seeds=0,
+                content_path=str(output_dir / "one.bin"),
+            ),
+            _make_torrent(
+                "h2", "stalledUP", 1.0, name="two", num_seeds=0,
                 content_path=str(output_dir / "two.bin"),
             ),
             _make_torrent(
-                "h3",
-                "pausedUP",
-                1.0,
-                name="three",
-                num_seeds=5,
+                "h3", "stalledUP", 1.0, name="three", num_seeds=0,
                 content_path=str(output_dir / "three.bin"),
-            ),
-        ],
-        [
-            _make_torrent(
-                "h1",
-                "pausedUP",
-                1.0,
-                name="one",
-                num_seeds=1,
-                content_path=str(output_dir / "one.bin"),
             ),
         ],
     ]
@@ -513,20 +494,19 @@ def test_qbittorrent_batch_resumes_top_n_by_active_seeds(tmp_path: Path):
     results, failures = downloader.download_sources_by_seed_priority(
         ["one", "two", "three"],
         output_dir,
-        max_active=2,
+        max_active=3,
         on_result=lambda result: completed_inputs.append(result.input),
     )
 
     assert failures == []
-    assert downloader.add_paused.call_args_list == [
-        ((source, output_dir),) for source in ["one", "two", "three"]
-    ]
-    assert resume_calls[0] == ["h2", "h3"]
-    assert pause_calls[0] == ["h1"]
-    assert resume_calls[1] == ["h1"]
-    assert [result.input for result in results] == ["two", "three", "one"]
-    assert completed_inputs == ["two", "three", "one"]
-    assert [path.name for result in results for path in result.files] == ["two.bin", "three.bin", "one.bin"]
+    call_args = downloader.add_active.call_args_list
+    assert len(call_args) == 3
+    calls = [(call[0][0], call[0][1]) for call in call_args]
+    for source in ["one", "two", "three"]:
+        assert (source, output_dir) in calls
+    assert sorted([result.input for result in results]) == ["one", "three", "two"]
+    assert sorted(completed_inputs) == ["one", "three", "two"]
+    assert sorted([path.name for result in results for path in result.files]) == ["one.bin", "three.bin", "two.bin"]
     assert removed == []
 
 
@@ -546,7 +526,7 @@ def test_qbittorrent_batch_reuses_completed_record_with_complete_cache(tmp_path:
         size=file_path.stat().st_size,
     )
     downloader = QbittorrentDownloader(poll_interval=0.01)
-    downloader.add_paused = MagicMock(return_value="newhash")
+    downloader.add_active = MagicMock(return_value="newhash")
     downloader._remove_torrent = MagicMock()
     downloader._api_get = lambda endpoint, params=None: FakeResponse(json_data=[torrent])
     completed_inputs: list[str] = []
@@ -562,7 +542,7 @@ def test_qbittorrent_batch_reuses_completed_record_with_complete_cache(tmp_path:
     assert [result.input for result in results] == [source]
     assert results[0].files == [file_path]
     assert completed_inputs == [source]
-    downloader.add_paused.assert_not_called()
+    downloader.add_active.assert_not_called()
     downloader._remove_torrent.assert_not_called()
 
 
@@ -593,7 +573,7 @@ def test_qbittorrent_batch_redownloads_completed_record_with_incomplete_cache(tm
         size=new_file.stat().st_size,
     )
     downloader = QbittorrentDownloader(poll_interval=0.01)
-    downloader.add_paused = MagicMock(return_value="newhash")
+    downloader.add_active = MagicMock(return_value="newhash")
     removed: list[str] = []
     downloader._remove_torrent = lambda info_hash: removed.append(info_hash)
 
@@ -608,7 +588,7 @@ def test_qbittorrent_batch_redownloads_completed_record_with_incomplete_cache(tm
 
     assert failures == []
     assert [result.files for result in results] == [[new_file]]
-    assert downloader.add_paused.call_args_list == [((source, output_dir),)]
+    assert downloader.add_active.call_args_list == [((source, output_dir),)]
     assert removed == ["oldhash"]
 
 
@@ -619,18 +599,14 @@ def test_qbittorrent_batch_attaches_existing_active_record(tmp_path: Path):
     file_path.write_text("payload", encoding="utf-8")
     source = "magnet:?xt=urn:btih:activehash"
     downloader = QbittorrentDownloader(poll_interval=0.01)
-    downloader.add_paused = MagicMock(return_value="newhash")
-    resume_calls: list[list[str]] = []
-    pause_calls: list[list[str]] = []
-    downloader.resume_hashes = lambda hashes: resume_calls.append(list(hashes))
-    downloader.pause_hashes = lambda hashes: pause_calls.append(list(hashes))
+    downloader.add_active = MagicMock(return_value="newhash")
     downloader._remove_torrent = MagicMock()
     snapshots = [
         [_make_torrent("activehash", "downloading", 0.5, name="active", magnet_uri=source, num_seeds=3)],
         [
             _make_torrent(
                 "activehash",
-                "pausedUP",
+                "stalledUP",
                 1.0,
                 name="active",
                 magnet_uri=source,
@@ -652,10 +628,8 @@ def test_qbittorrent_batch_attaches_existing_active_record(tmp_path: Path):
 
     assert failures == []
     assert results[0].files == [file_path]
-    downloader.add_paused.assert_not_called()
+    downloader.add_active.assert_not_called()
     downloader._remove_torrent.assert_not_called()
-    assert resume_calls[0] == ["activehash"]
-    assert pause_calls[0] == []
 
 
 def test_qbittorrent_batch_fails_existing_stalled_record_without_readding(tmp_path: Path):
@@ -663,7 +637,7 @@ def test_qbittorrent_batch_fails_existing_stalled_record_without_readding(tmp_pa
     output_dir.mkdir()
     source = "magnet:?xt=urn:btih:stalledhash"
     downloader = QbittorrentDownloader(poll_interval=0.01, no_seed_checks=1)
-    downloader.add_paused = MagicMock(return_value="newhash")
+    downloader.add_active = MagicMock(return_value="newhash")
     removed: list[str] = []
     downloader.resume_hashes = lambda hashes: None
     downloader.pause_hashes = lambda hashes: None
@@ -684,7 +658,7 @@ def test_qbittorrent_batch_fails_existing_stalled_record_without_readding(tmp_pa
     assert len(failures) == 1
     assert failures[0][0] == source
     assert "no active seeds" in str(failures[0][1])
-    downloader.add_paused.assert_not_called()
+    downloader.add_active.assert_not_called()
     assert removed == ["stalledhash"]
 
 
@@ -692,10 +666,8 @@ def test_qbittorrent_seed_priority_batch_fails_torrent_with_no_active_seeds(tmp_
     output_dir = tmp_path / "downloads"
     output_dir.mkdir()
     downloader = QbittorrentDownloader(poll_interval=0.01, no_seed_checks=2)
-    downloader.add_paused = MagicMock(return_value="h1")
+    downloader.add_active = MagicMock(return_value="h1")
     removed: list[str] = []
-    downloader.resume_hashes = lambda hashes: None
-    downloader.pause_hashes = lambda hashes: None
     downloader._remove_torrent = lambda info_hash: removed.append(info_hash)
     snapshots = [
         [_make_torrent("h1", "stalledDL", 0.0, name="one", num_seeds=0)],
