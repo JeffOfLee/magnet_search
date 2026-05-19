@@ -26,6 +26,15 @@ class QbittorrentDownloadStatus:
     save_path: str
 
 
+@dataclass(frozen=True)
+class _SeedPrioritySource:
+    index: int
+    source: str
+    input: str
+    keyword: str = ""
+    origin: str = ""
+
+
 def _torrent_info_hash(data: bytes) -> str:
     info_start = data.find(b"4:infod")
     if info_start == -1:
@@ -121,7 +130,151 @@ class QbittorrentDownloader:
         response.raise_for_status()
         return response
 
+    def add_paused(self, source: str, output_dir: Path) -> str:
+        return self._add_source(source, output_dir, paused=True)
+
+    def resume_hashes(self, hashes: list[str]) -> None:
+        self._set_hashes_state("/api/v2/torrents/resume", hashes)
+
+    def pause_hashes(self, hashes: list[str]) -> None:
+        self._set_hashes_state("/api/v2/torrents/pause", hashes)
+
+    def _set_hashes_state(self, endpoint: str, hashes: list[str]) -> None:
+        if not hashes:
+            return
+        self._api_post(endpoint, data={"hashes": "|".join(hashes)})
+
+    def download_sources_by_seed_priority(
+        self,
+        sources: list[object],
+        output_dir: Path,
+        max_active: int,
+    ) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
+        if max_active < 1:
+            raise DownloadError("max_active must be at least 1")
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tracked: dict[str, _SeedPrioritySource] = {}
+        results: list[DownloadResult] = []
+        failures: list[tuple[str, Exception]] = []
+        no_seed_counts: dict[str, int] = {}
+
+        for index, raw_source in enumerate(sources):
+            source = _seed_priority_source(raw_source, index)
+            try:
+                info_hash = self.add_paused(source.source, output_dir)
+            except Exception as error:
+                failures.append((source.input, error))
+                continue
+            tracked[info_hash] = source
+            no_seed_counts[info_hash] = 0
+
+        while tracked:
+            torrents_by_hash = self._tracked_torrents(tracked.keys())
+            for info_hash in list(tracked):
+                torrent = torrents_by_hash.get(info_hash)
+                source = tracked[info_hash]
+                if torrent is None:
+                    failures.append((source.input, DownloadError("qBittorrent torrent disappeared")))
+                    self._remove_torrent(info_hash)
+                    del tracked[info_hash]
+                    no_seed_counts.pop(info_hash, None)
+                    continue
+
+                state = str(torrent.get("state", ""))
+                progress = _float_value(torrent.get("progress"))
+                if state in ("error", "missingFiles"):
+                    failures.append((source.input, DownloadError(f"qBittorrent torrent error state: {state}")))
+                    self._remove_torrent(info_hash)
+                    del tracked[info_hash]
+                    no_seed_counts.pop(info_hash, None)
+                    continue
+
+                if progress >= 1.0:
+                    results.append(self._download_result_from_source_torrent(source, torrent, output_dir))
+                    self._remove_torrent(info_hash)
+                    del tracked[info_hash]
+                    no_seed_counts.pop(info_hash, None)
+                    continue
+
+                if self._has_no_active_seeds(torrent):
+                    no_seed_counts[info_hash] = no_seed_counts.get(info_hash, 0) + 1
+                    if no_seed_counts[info_hash] >= self.no_seed_checks:
+                        failures.append((source.input, DownloadError("qBittorrent torrent has no active seeds")))
+                        self._remove_torrent(info_hash)
+                        del tracked[info_hash]
+                        no_seed_counts.pop(info_hash, None)
+                else:
+                    no_seed_counts[info_hash] = 0
+
+            if not tracked:
+                break
+
+            unfinished = [
+                (info_hash, torrents_by_hash[info_hash])
+                for info_hash in tracked
+                if info_hash in torrents_by_hash
+            ]
+            unfinished.sort(
+                key=lambda item: (
+                    -_int_value(item[1].get("num_seeds")),
+                    tracked[item[0]].index,
+                )
+            )
+            active_hashes = [info_hash for info_hash, _ in unfinished[:max_active]]
+            paused_hashes = [info_hash for info_hash, _ in unfinished[max_active:]]
+            self.resume_hashes(active_hashes)
+            self.pause_hashes(paused_hashes)
+            time.sleep(self.poll_interval)
+
+        return results, failures
+
+    def _tracked_torrents(self, hashes: object) -> dict[str, dict]:
+        hash_list = list(hashes)
+        if not hash_list:
+            return {}
+        response = self._api_get("/api/v2/torrents/info", params={"hashes": "|".join(hash_list)})
+        torrents_by_hash: dict[str, dict] = {}
+        for torrent in response.json():
+            info_hash = str(torrent.get("hash", ""))
+            if info_hash:
+                torrents_by_hash[info_hash] = torrent
+        return torrents_by_hash
+
+    def _download_result_from_source_torrent(
+        self,
+        source: _SeedPrioritySource,
+        torrent: dict,
+        output_dir: Path,
+    ) -> DownloadResult:
+        return DownloadResult(
+            magnet=source.source,
+            files=self._torrent_files(torrent, output_dir),
+            keyword=source.keyword,
+            origin=source.origin,
+            input=source.input,
+        )
+
     def download(self, source: str, output_dir: Path) -> DownloadResult:
+        source = source.strip()
+        if not source:
+            raise DownloadError("download source must be non-empty")
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        before = _snapshot_files(output_dir)
+        info_hash = self._add_source(source, output_dir)
+
+        self._wait_for_completion(info_hash)
+
+        after = _snapshot_files(output_dir)
+        new_files = _changed_files(before, after)
+        self._log(f"download done: {len(new_files)} file(s)")
+
+        self._remove_torrent(info_hash)
+
+        return DownloadResult(magnet=source, files=new_files)
+
+    def _add_source(self, source: str, output_dir: Path, paused: bool = False) -> str:
         source = source.strip()
         if not source:
             raise DownloadError("download source must be non-empty")
@@ -131,11 +284,12 @@ class QbittorrentDownloader:
         self._log(f"download start: {short_name}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        before = _snapshot_files(output_dir)
-
         existing_hashes = self._get_hashes()
 
         already_exists = False
+        data = {"savepath": str(output_dir)}
+        if paused:
+            data["paused"] = "true"
         if source_path.suffix.lower() == ".torrent" and source_path.exists():
             self._log(f"adding torrent file: {source_path.name} ({source_path.stat().st_size / 1024:.0f} KB)")
             torrent_data = source_path.read_bytes()
@@ -143,7 +297,7 @@ class QbittorrentDownloader:
             try:
                 response = self._api_post(
                     "/api/v2/torrents/add",
-                    data={"savepath": str(output_dir)},
+                    data=data,
                     files=files_payload,
                 )
             except httpx.HTTPStatusError as exc:
@@ -155,9 +309,10 @@ class QbittorrentDownloader:
         else:
             self._log(f"adding magnet/url: {source[:80]}")
             try:
+                data["urls"] = source
                 response = self._api_post(
                     "/api/v2/torrents/add",
-                    data={"urls": source, "savepath": str(output_dir)},
+                    data=data,
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
@@ -189,15 +344,7 @@ class QbittorrentDownloader:
                 raise DownloadError("qBittorrent could not find added torrent")
             self._log(f"found new hash: {info_hash}")
 
-        self._wait_for_completion(info_hash)
-
-        after = _snapshot_files(output_dir)
-        new_files = _changed_files(before, after)
-        self._log(f"download done: {len(new_files)} file(s)")
-
-        self._remove_torrent(info_hash)
-
-        return DownloadResult(magnet=source, files=new_files)
+        return info_hash
 
     def _remove_torrent(self, info_hash: str) -> None:
         self._log(f"removing torrent: {info_hash}")
@@ -420,3 +567,18 @@ def _float_value(value: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _seed_priority_source(source: object, index: int) -> _SeedPrioritySource:
+    if isinstance(source, str):
+        return _SeedPrioritySource(index=index, source=source, input=source)
+
+    source_value = str(getattr(source, "source", source))
+    input_value = str(getattr(source, "input", source_value))
+    return _SeedPrioritySource(
+        index=index,
+        source=source_value,
+        input=input_value,
+        keyword=str(getattr(source, "keyword", "")),
+        origin=str(getattr(source, "origin", "")),
+    )

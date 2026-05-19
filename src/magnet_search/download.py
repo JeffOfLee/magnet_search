@@ -516,12 +516,55 @@ def run_download_batch(
     if download_concurrency < 1:
         raise DownloadError("download_concurrency must be at least 1")
 
+    sources = collect_download_sources(input_path, column, output_dir, result_path, skip_sources)
+    download_meta_path = result_path or output_dir / DOWNLOAD_RECORD_FILENAME
+    results: list[DownloadResult] = []
+    failures: list[tuple[str, Exception]] = []
+
+    recorder_context = _ResultRecorder(download_meta_path, output_dir)
+    if recorder_context is None:
+        results, failures = _run_downloads(
+            sources,
+            output_dir,
+            downloader,
+            download_concurrency,
+            on_result,
+            before_download,
+            failures,
+            results,
+        )
+    else:
+        with recorder_context as recorder:
+            results, failures = _run_downloads(
+                sources,
+                output_dir,
+                downloader,
+                download_concurrency,
+                on_result,
+                before_download,
+                failures,
+                results,
+                recorder,
+            )
+
+    if failures and raise_on_failure:
+        raise DownloadError(_failure_message(failures), failures=failures)
+    return results, failures
+
+
+def collect_download_sources(
+    input_path: Path,
+    column: str,
+    output_dir: Path,
+    result_path: Path | None = None,
+    skip_sources: set[str] | None = None,
+) -> list[DownloadSource]:
     with input_path.open(newline="", encoding="utf-8-sig") as input_file:
         reader = csv.DictReader(input_file)
         selected_column = _select_download_column(reader.fieldnames, column)
         _validate_headers(reader.fieldnames, selected_column)
 
-        skipped = skip_sources or set()
+        skipped = set(skip_sources or set())
         download_meta_path = result_path or output_dir / DOWNLOAD_RECORD_FILENAME
         existing_records = load_download_records(download_meta_path)
         _cleanup_record_paths(existing_records, output_dir, "failed")
@@ -533,39 +576,7 @@ def run_download_batch(
             source = _source_from_row(row, selected_column, input_path.parent)
             if source is not None and not _source_is_skipped(source.input, skipped):
                 sources.append(source)
-
-        results: list[DownloadResult] = []
-        failures: list[tuple[str, Exception]] = []
-
-        recorder_context = _ResultRecorder(download_meta_path, output_dir)
-        if recorder_context is None:
-            results, failures = _run_downloads(
-                sources,
-                output_dir,
-                downloader,
-                download_concurrency,
-                on_result,
-                before_download,
-                failures,
-                results,
-            )
-        else:
-            with recorder_context as recorder:
-                results, failures = _run_downloads(
-                    sources,
-                    output_dir,
-                    downloader,
-                    download_concurrency,
-                    on_result,
-                    before_download,
-                    failures,
-                    results,
-                    recorder,
-                )
-
-    if failures and raise_on_failure:
-        raise DownloadError(_failure_message(failures), failures=failures)
-    return results, failures
+        return sources
 
 
 def _run_downloads(

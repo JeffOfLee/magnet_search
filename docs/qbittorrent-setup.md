@@ -13,6 +13,8 @@ The `QbittorrentDownloader` communicates with a running qBittorrent instance thr
 
 For CSV downloads, startup recovery also inspects existing qBittorrent tasks. Existing `downloading` tasks are recorded to download metadata after they complete, and existing `stalledDL` tasks are recorded immediately so restarts do not add duplicate torrents.
 
+When `--engine qbittorrent` is used with a CSV batch, `magnet-search` submits all pending sources to qBittorrent in a paused state first. It then polls qBittorrent, sorts unfinished torrents by active seed count, and resumes only the top `--download-concurrency` torrents. Lower-seed unfinished torrents stay paused until a higher-priority active download completes or fails.
+
 qBittorrent must be installed and running separately with Web UI enabled.
 
 ## Prerequisites
@@ -246,6 +248,9 @@ magnet-search download movie.torrent --storage downloads/ --engine qbittorrent \
 
 # With magnet link
 magnet-search download "magnet:?xt=urn:btih:..." --storage downloads/ --engine qbittorrent
+
+# CSV batch: submit all tasks, download the top 3 unfinished torrents by active seeds
+magnet-search download input.csv --storage downloads/ --engine qbittorrent --download-concurrency 3
 
 # Monitor current qBittorrent downloads, refreshing every 1 second
 magnet-search qbittorrent-monitor \

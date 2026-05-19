@@ -23,6 +23,7 @@ from magnet_search.download import (
     DownloadResult,
     TransferCacheStorage,
     append_download_record,
+    collect_download_sources,
     cleanup_download_result,
     load_download_records,
     parse_storage_size,
@@ -373,6 +374,49 @@ def _collect_upload_futures(upload_futures: list[Future[list[str]]]) -> list[str
     return uploaded
 
 
+def _run_qbittorrent_seed_priority_batch(
+    input_path: Path,
+    column: str,
+    storage: Path,
+    downloader: QbittorrentDownloader,
+    download_concurrency: int,
+    download_meta: Path,
+    on_result: ResultCallback | None = None,
+    raise_on_failure: bool = True,
+    skip_sources: set[str] | None = None,
+) -> tuple[list[DownloadResult], list[tuple[str, Exception]]]:
+    sources = collect_download_sources(
+        input_path,
+        column,
+        storage,
+        result_path=download_meta,
+        skip_sources=skip_sources,
+    )
+    results, failures = downloader.download_sources_by_seed_priority(
+        sources,
+        storage,
+        max_active=download_concurrency,
+    )
+    source_by_input = {source.input: source for source in sources}
+    for result in results:
+        append_download_record(download_meta, result, base_dir=storage)
+        if on_result is not None:
+            on_result(result)
+    for source_input, error in failures:
+        source = source_by_input.get(source_input)
+        append_download_record(
+            download_meta,
+            failure=(source_input, error),
+            failure_keyword=source.keyword if source is not None else "",
+            failure_origin=source.origin if source is not None else "",
+            base_dir=storage,
+        )
+    if failures and raise_on_failure:
+        details = "; ".join(f"{source}: {error}" for source, error in failures)
+        raise DownloadError(f"{len(failures)} download(s) failed: {details}", failures=failures)
+    return results, failures
+
+
 def _run_search_batch_or_exit(
     input_csv: Path,
     column: str,
@@ -586,18 +630,29 @@ def download(
 
         if uploader is None:
             if is_batch:
-                batch_kwargs = {
-                    "input_path": Path(source),
-                    "column": column,
-                    "output_dir": storage,
-                    "downloader": downloader,
-                    "download_concurrency": download_concurrency,
-                    "result_path": resolved_download_meta,
-                }
                 active_sources = _active_download_sources(downloader) | startup_sources
-                if active_sources:
-                    batch_kwargs["skip_sources"] = active_sources
-                results, _ = run_download_batch(**batch_kwargs)
+                if engine == "qbittorrent":
+                    results, _ = _run_qbittorrent_seed_priority_batch(
+                        Path(source),
+                        column,
+                        storage,
+                        downloader,
+                        download_concurrency,
+                        resolved_download_meta,
+                        skip_sources=active_sources or None,
+                    )
+                else:
+                    batch_kwargs = {
+                        "input_path": Path(source),
+                        "column": column,
+                        "output_dir": storage,
+                        "downloader": downloader,
+                        "download_concurrency": download_concurrency,
+                        "result_path": resolved_download_meta,
+                    }
+                    if active_sources:
+                        batch_kwargs["skip_sources"] = active_sources
+                    results, _ = run_download_batch(**batch_kwargs)
                 all_results = startup_results + results
                 file_count = sum(len(result.files) for result in all_results)
                 _verbose(verbose, f"download completed items={len(all_results)} files={file_count}")
@@ -707,9 +762,22 @@ def download(
                     batch_kwargs["skip_sources"] = set(batch_kwargs.get("skip_sources", set())) | active_sources
                 if startup_sources:
                     batch_kwargs["skip_sources"] = set(batch_kwargs.get("skip_sources", set())) | startup_sources
-                if transfer_cache is not None:
-                    batch_kwargs["before_download"] = transfer_cache.wait_for_space
-                download_results, download_failures = run_download_batch(**batch_kwargs)
+                if engine == "qbittorrent":
+                    download_results, download_failures = _run_qbittorrent_seed_priority_batch(
+                        Path(source),
+                        column,
+                        storage,
+                        downloader,
+                        download_concurrency,
+                        resolved_download_meta,
+                        on_result=enqueue_upload,
+                        raise_on_failure=False,
+                        skip_sources=batch_kwargs.get("skip_sources"),
+                    )
+                else:
+                    if transfer_cache is not None:
+                        batch_kwargs["before_download"] = transfer_cache.wait_for_space
+                    download_results, download_failures = run_download_batch(**batch_kwargs)
                 file_count = sum(len(result.files) for result in download_results)
                 _verbose(verbose, f"download completed items={len(download_results)} files={file_count}")
                 typer.echo(f"downloaded {len(download_results)} item(s), {file_count} file(s)")

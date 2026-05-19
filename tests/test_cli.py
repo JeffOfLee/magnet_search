@@ -470,13 +470,11 @@ def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path
         def active_download_sources(self):
             return {"active"}
 
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+            captured["sources"] = [source.input for source in sources]
+            return [], []
+
     monkeypatch.setattr(cli, "QbittorrentDownloader", lambda **kwargs: ActiveDownloader())
-
-    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, **kwargs):
-        captured["skip_sources"] = kwargs.get("skip_sources")
-        return [], []
-
-    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
 
     result = runner.invoke(
         cli.app,
@@ -491,7 +489,7 @@ def test_download_command_skips_active_qbittorrent_sources(monkeypatch, tmp_path
     )
 
     assert result.exit_code == 0
-    assert captured["skip_sources"] == {"active"}
+    assert captured["sources"] == ["fresh"]
 
 
 def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_path):
@@ -513,13 +511,11 @@ def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_p
                 )
             ]
 
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+            captured["sources"] = [source.input for source in sources]
+            return [], []
+
     monkeypatch.setattr(cli, "QbittorrentDownloader", lambda **kwargs: RecoveringDownloader())
-
-    def fake_run_download_batch(input_path, column, output_dir, downloader, download_concurrency, **kwargs):
-        captured["skip_sources"] = kwargs.get("skip_sources")
-        return [], []
-
-    monkeypatch.setattr(cli, "run_download_batch", fake_run_download_batch)
 
     result = runner.invoke(
         cli.app,
@@ -534,7 +530,7 @@ def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_p
     )
 
     assert result.exit_code == 0
-    assert captured["skip_sources"] == {"magnet:?xt=urn:btih:recovered"}
+    assert captured["sources"] == ["fresh"]
     rows = list(csv.DictReader((storage_path / DOWNLOAD_RECORD_FILENAME).open(encoding="utf-8")))
     assert rows == [
         {
@@ -547,6 +543,111 @@ def test_download_command_records_qbittorrent_startup_results(monkeypatch, tmp_p
             "err": "",
         }
     ]
+
+
+def test_download_command_routes_qbittorrent_batch_to_seed_priority_scheduler(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\nsecond\nthird\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    captured = {}
+
+    class SeedPriorityDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def startup_download_results(self, storage):
+            return []
+
+        def active_download_sources(self):
+            return set()
+
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+            captured["sources"] = sources
+            captured["output_dir"] = output_dir
+            captured["max_active"] = max_active
+            return [
+                cli.DownloadResult(magnet=source.source, files=[output_dir / f"{source.input}.bin"], input=source.input)
+                for source in sources
+            ], []
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", SeedPriorityDownloader)
+    monkeypatch.setattr(
+        cli,
+        "run_download_batch",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("generic batch should not run")),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--engine",
+            "qbittorrent",
+            "--download-concurrency",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert [source.input for source in captured["sources"]] == ["first", "second", "third"]
+    assert captured["output_dir"] == storage_path
+    assert captured["max_active"] == 2
+    assert "downloaded 3 item(s), 3 file(s)" in result.stdout
+
+
+def test_download_command_uploads_qbittorrent_seed_priority_batch_results(monkeypatch, tmp_path):
+    input_path = tmp_path / "input.csv"
+    input_path.write_text("magnet\nfirst\nsecond\n", encoding="utf-8")
+    storage_path = tmp_path / "downloads"
+    first_file = storage_path / "first.mp4"
+    second_file = storage_path / "second.mp4"
+    upload_path = tmp_path / "s3-upload.toml"
+    upload_path.write_text('bucket = "my-bucket"\n', encoding="utf-8")
+    uploader = FakeUploader()
+
+    class SeedPriorityDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def startup_download_results(self, storage):
+            return []
+
+        def active_download_sources(self):
+            return set()
+
+        def download_sources_by_seed_priority(self, sources, output_dir, max_active):
+            first_file.parent.mkdir(parents=True, exist_ok=True)
+            first_file.write_text("payload", encoding="utf-8")
+            second_file.write_text("payload", encoding="utf-8")
+            return [
+                cli.DownloadResult(magnet="first", files=[first_file], input="first"),
+                cli.DownloadResult(magnet="second", files=[second_file], input="second"),
+            ], []
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", SeedPriorityDownloader)
+    monkeypatch.setattr(cli, "build_s3_uploader", lambda path, key_gen="hash": uploader)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "download",
+            str(input_path),
+            "--storage",
+            str(storage_path),
+            "--engine",
+            "qbittorrent",
+            "--upload",
+            str(upload_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert uploader.calls == [([first_file], storage_path), ([second_file], storage_path)]
+    assert "downloaded 2 item(s), 2 file(s)" in result.stdout
+    assert "uploaded 2 file(s)" in result.stdout
 
 
 def test_qbittorrent_monitor_renders_current_downloads_once(monkeypatch):
@@ -580,6 +681,70 @@ def test_qbittorrent_monitor_renders_current_downloads_once(monkeypatch):
     assert "downloading" in result.stdout
     assert "50.0%" in result.stdout
     assert "500.0 KB/s" in result.stdout
+
+
+def test_qbittorrent_monitor_renders_all_current_downloads_once(monkeypatch):
+    class MonitoringDownloader:
+        def __init__(self, **kwargs):
+            pass
+
+        def list_downloads(self):
+            return [
+                QbittorrentDownloadStatus(
+                    name="Ubuntu ISO",
+                    state="downloading",
+                    progress=0.5,
+                    size=2_000_000,
+                    downloaded=1_000_000,
+                    download_speed=500_000,
+                    upload_speed=10_000,
+                    eta=60,
+                    seeds=7,
+                    peers=3,
+                    save_path="/downloads/linux",
+                ),
+                QbittorrentDownloadStatus(
+                    name="Archive Pack",
+                    state="stalledDL",
+                    progress=0.25,
+                    size=4_000_000,
+                    downloaded=1_000_000,
+                    download_speed=0,
+                    upload_speed=0,
+                    eta=0,
+                    seeds=0,
+                    peers=1,
+                    save_path="/downloads/archive",
+                ),
+                QbittorrentDownloadStatus(
+                    name="Finished Dataset",
+                    state="uploading",
+                    progress=1.0,
+                    size=8_000_000,
+                    downloaded=8_000_000,
+                    download_speed=0,
+                    upload_speed=20_000,
+                    eta=0,
+                    seeds=12,
+                    peers=0,
+                    save_path="/downloads/data",
+                ),
+            ]
+
+    monkeypatch.setattr(cli, "QbittorrentDownloader", MonitoringDownloader)
+
+    result = runner.invoke(cli.app, ["qbittorrent-monitor", "--once"])
+
+    assert result.exit_code == 0
+    assert "Ubuntu ISO" in result.stdout
+    assert "downloading" in result.stdout
+    assert "50.0%" in result.stdout
+    assert "Archive Pack" in result.stdout
+    assert "stalledDL" in result.stdout
+    assert "25.0%" in result.stdout
+    assert "Finished Dataset" in result.stdout
+    assert "uploading" in result.stdout
+    assert "100.0%" in result.stdout
 
 
 def test_download_command_uses_upload_concurrency_for_batch_uploads(monkeypatch, tmp_path):
